@@ -18,14 +18,18 @@ memory:
 
 breakpoints:
   bp list
-  bp set <addr> [--kind sw|hw|page] [--no-halt] [--one-shot]
+  bp set <addr|module!symbol> [--kind sw|hw|page] [--no-halt] [--one-shot]
          [--access x|w|rw|any] [--size N] [--tid N]
   bp clear <id>
+
+symbols:
+  resolve <module!symbol>     print address of an export
 
 halts:
   halts                      list currently parked hits
   wait [--timeout <ms>]      block until a new halt (or timeout, default 30000)
   regs <hit_id>              dump registers
+  stack <hit_id> [--depth N] backtrace from rbp chain (default 32, max 256)
   setregs <hit_id>           read key=value lines from stdin and apply
   resume <hit_id> [--step|--ret]
 
@@ -72,6 +76,7 @@ fn dispatch(args: &[String]) -> Result<(), String> {
         "halts" => get("/halts").map(print_ok),
         "wait" => cmd_wait(rest),
         "regs" => cmd_regs(rest),
+        "stack" => cmd_stack(rest),
         "setregs" => cmd_setregs(rest),
         "resume" => cmd_resume(rest),
 
@@ -81,6 +86,10 @@ fn dispatch(args: &[String]) -> Result<(), String> {
             get(&format!("/modules/{name}/exports")).map(print_ok)
         }
         "regions" => get("/memory/regions").map(print_ok),
+        "resolve" => {
+            let name = rest.first().ok_or("resolve <module!symbol>")?;
+            get(&format!("/symbols/resolve?name={}", url_encode(name))).map(print_ok)
+        }
 
         "-h" | "--help" | "help" => {
             println!("{USAGE}");
@@ -136,8 +145,12 @@ fn cmd_bp(args: &[String]) -> Result<(), String> {
             post(&format!("/bp/clear?id={id}"), &[]).map(print_ok)
         }
         "set" => {
-            let addr = rest.first().ok_or("bp set <addr> [opts]")?;
-            let mut query = format!("addr={addr}");
+            let target = rest.first().ok_or("bp set <addr|module!symbol> [opts]")?;
+            let mut query = if target.contains('!') {
+                format!("name={}", url_encode(target))
+            } else {
+                format!("addr={target}")
+            };
             let mut i = 1;
             while i < rest.len() {
                 match rest[i].as_str() {
@@ -187,6 +200,25 @@ fn cmd_wait(args: &[String]) -> Result<(), String> {
 fn cmd_regs(args: &[String]) -> Result<(), String> {
     let id = args.first().ok_or("regs <hit_id>")?;
     get(&format!("/halts/{id}")).map(print_ok)
+}
+
+fn cmd_stack(args: &[String]) -> Result<(), String> {
+    let id = args.first().ok_or("stack <hit_id> [--depth N]")?;
+    let mut depth: Option<&str> = None;
+    let mut i = 1;
+    while i < args.len() {
+        if args[i] == "--depth" {
+            depth = Some(args.get(i + 1).ok_or("--depth value")?);
+            i += 2;
+        } else {
+            return Err(format!("unknown flag: {}", args[i]));
+        }
+    }
+    let path = match depth {
+        Some(n) => format!("/halts/{id}/stack?depth={n}"),
+        None => format!("/halts/{id}/stack"),
+    };
+    get(&path).map(print_ok)
 }
 
 fn cmd_setregs(args: &[String]) -> Result<(), String> {
@@ -275,6 +307,20 @@ fn request(method: &str, path: &str, body: Option<&[u8]>) -> Result<Vec<u8>, Str
         return Err(format!("HTTP {status}: {}", s.trim()));
     }
     Ok(body_bytes)
+}
+
+fn url_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        let safe = b.is_ascii_alphanumeric()
+            || matches!(b, b'-' | b'_' | b'.' | b'~' | b'!');
+        if safe {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{:02X}", b));
+        }
+    }
+    out
 }
 
 fn hex_decode(s: &str) -> Option<Vec<u8>> {

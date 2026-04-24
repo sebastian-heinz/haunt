@@ -188,7 +188,7 @@ fn route(
     if let Some(rest) = path.strip_prefix("/modules/") {
         if method == Method::Get {
             if let Some(name) = rest.strip_suffix("/exports") {
-                return handle_module_exports(process, name);
+                return handle_module_exports(process, &percent_decode(name));
             }
         }
     }
@@ -201,6 +201,7 @@ fn route(
         (Method::Post, "/bp/set") => handle_bp_set(process, query),
         (Method::Post, "/bp/clear") => handle_bp_clear(process, query),
         (Method::Get, "/bp/list") => handle_bp_list(process),
+        (Method::Get, "/symbols/resolve") => handle_symbol_resolve(process, query),
         (Method::Get, "/halts") => handle_halts_list(process),
         (Method::Get, "/halts/wait") => handle_halts_wait(process, query),
         (Method::Get, "/modules") => handle_modules(process),
@@ -221,11 +222,10 @@ fn route(
 fn handle_halt_sub(
     method: &Method,
     rest: &str,
-    _query: &str,
+    query: &str,
     process: &dyn Process,
     req: &mut Request,
 ) -> Response<Body> {
-    // rest = "<hit_id>" or "<hit_id>/regs" or "<hit_id>/resume"
     let (id_str, action) = match rest.find('/') {
         Some(i) => (&rest[..i], &rest[i + 1..]),
         None => (rest, ""),
@@ -238,6 +238,7 @@ fn handle_halt_sub(
             Some(regs) => text(200, &format_regs(&regs)),
             None => text(404, "not found"),
         },
+        (Method::Get, "stack") => handle_halt_stack(process, hit_id, query),
         (Method::Post, "regs") => {
             let mut body = String::new();
             if req.as_reader().read_to_string(&mut body).is_err() {
@@ -254,7 +255,7 @@ fn handle_halt_sub(
             }
         }
         (Method::Post, "resume") => {
-            let mode = parse_resume_mode(_query).unwrap_or(ResumeMode::Continue);
+            let mode = parse_resume_mode(query).unwrap_or(ResumeMode::Continue);
             match process.halt_resume(hit_id, mode) {
                 Ok(()) => text(200, "resumed"),
                 Err(BpError::NotFound) => text(404, "not found"),
@@ -265,10 +266,84 @@ fn handle_halt_sub(
     }
 }
 
+const STACK_DEFAULT_DEPTH: usize = 32;
+const STACK_MAX_DEPTH: usize = 256;
+
+fn handle_halt_stack(process: &dyn Process, hit_id: u64, query: &str) -> Response<Body> {
+    let depth = parse_query(query)
+        .find(|(k, _)| *k == "depth")
+        .and_then(|(_, v)| v.parse::<usize>().ok())
+        .unwrap_or(STACK_DEFAULT_DEPTH)
+        .clamp(1, STACK_MAX_DEPTH);
+
+    let Some(regs) = process.halt_regs(hit_id) else {
+        return text(404, "not found");
+    };
+
+    // rbp-chain walk. Fragile on code built with frame pointers omitted
+    // (MSVC /Oy, rustc release default); surface what we can and bail on
+    // the first unreadable frame.
+    let modules = process.modules();
+    let mut body = String::new();
+    let push_frame = |idx: usize, rip: u64, body: &mut String| {
+        body.push_str(&format!("#{idx} rip=0x{:x}", rip));
+        if let Some((name, off)) = resolve_addr(&modules, rip) {
+            body.push_str(&format!(" {name}+0x{off:x}"));
+        }
+        body.push('\n');
+    };
+
+    push_frame(0, regs.rip, &mut body);
+
+    let mut rbp = regs.rbp;
+    for i in 1..depth {
+        if rbp == 0 {
+            break;
+        }
+        let ret = match read_u64(process, rbp.wrapping_add(8) as usize) {
+            Some(v) if v != 0 => v,
+            _ => break,
+        };
+        let prev = match read_u64(process, rbp as usize) {
+            Some(v) => v,
+            None => break,
+        };
+        push_frame(i, ret, &mut body);
+        // Stack grows down on x64 — a non-increasing rbp chain is a sentinel
+        // or a non-frame-pointer function; stop rather than loop.
+        if prev <= rbp {
+            break;
+        }
+        rbp = prev;
+    }
+    text(200, &body)
+}
+
+fn read_u64(process: &dyn Process, addr: usize) -> Option<u64> {
+    let bytes = process.read_memory(addr, 8).ok()?;
+    if bytes.len() < 8 {
+        return None;
+    }
+    let mut buf = [0u8; 8];
+    buf.copy_from_slice(&bytes[..8]);
+    Some(u64::from_le_bytes(buf))
+}
+
+fn resolve_addr(modules: &[ModuleInfo], addr: u64) -> Option<(&str, usize)> {
+    let a = addr as usize;
+    modules.iter().find_map(|m| {
+        if a >= m.base && a < m.base.saturating_add(m.size) {
+            Some((m.name.as_str(), a - m.base))
+        } else {
+            None
+        }
+    })
+}
+
 fn parse_resume_mode(query: &str) -> Option<ResumeMode> {
     parse_query(query)
         .find(|(k, _)| *k == "mode")
-        .and_then(|(_, v)| match v {
+        .and_then(|(_, v)| match v.as_str() {
             "continue" => Some(ResumeMode::Continue),
             "step" => Some(ResumeMode::Step),
             "ret" => Some(ResumeMode::Ret),
@@ -415,12 +490,12 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 fn handle_read(process: &dyn Process, query: &str) -> Response<Body> {
     let mut addr = None;
     let mut len = None;
-    let mut format = "hex";
+    let mut raw = false;
     for (k, v) in parse_query(query) {
         match k {
-            "addr" => addr = parse_usize(v),
-            "len" => len = parse_usize(v),
-            "format" => format = v,
+            "addr" => addr = parse_usize(&v),
+            "len" => len = parse_usize(&v),
+            "format" => raw = v == "raw",
             _ => {}
         }
     }
@@ -436,16 +511,17 @@ fn handle_read(process: &dyn Process, query: &str) -> Response<Body> {
         Err(MemError::Fault) => return text(403, "unreadable"),
         Err(MemError::InvalidRange) => return text(400, "invalid range"),
     };
-    match format {
-        "raw" => binary(200, bytes),
-        _ => text(200, &hex_encode(&bytes)),
+    if raw {
+        binary(200, bytes)
+    } else {
+        text(200, &hex_encode(&bytes))
     }
 }
 
 fn handle_write(process: &dyn Process, query: &str, req: &mut Request) -> Response<Body> {
     let addr = parse_query(query)
         .find(|(k, _)| *k == "addr")
-        .and_then(|(_, v)| parse_usize(v));
+        .and_then(|(_, v)| parse_usize(&v));
     let Some(addr) = addr else {
         return text(400, "missing addr");
     };
@@ -468,32 +544,40 @@ fn handle_write(process: &dyn Process, query: &str, req: &mut Request) -> Respon
 
 fn handle_bp_set(process: &dyn Process, query: &str) -> Response<Body> {
     let mut addr: Option<usize> = None;
-    let mut kind_str: Option<&str> = None;
-    let mut access_str: Option<&str> = None;
+    let mut name: Option<String> = None;
+    let mut kind_str: Option<String> = None;
+    let mut access_str: Option<String> = None;
     let mut size_u: Option<usize> = None;
     let mut halt_flag: Option<bool> = None;
     let mut one_shot: Option<bool> = None;
     let mut tid_filter: Option<u32> = None;
     for (k, v) in parse_query(query) {
         match k {
-            "addr" => addr = parse_usize(v),
+            "addr" => addr = parse_usize(&v),
+            "name" => name = Some(v),
             "kind" => kind_str = Some(v),
             "access" => access_str = Some(v),
-            "size" => size_u = parse_usize(v),
-            "halt" => halt_flag = parse_bool(v),
-            "one_shot" | "oneshot" => one_shot = parse_bool(v),
+            "size" => size_u = parse_usize(&v),
+            "halt" => halt_flag = parse_bool(&v),
+            "one_shot" | "oneshot" => one_shot = parse_bool(&v),
             "tid" | "tid_filter" => tid_filter = v.parse().ok(),
             _ => {}
         }
     }
-    let Some(addr) = addr else {
-        return text(400, "missing addr");
+    let addr = match (addr, name) {
+        (Some(_), Some(_)) => return text(400, "addr and name are exclusive"),
+        (Some(a), None) => a,
+        (None, Some(n)) => match resolve_symbol(process, &n) {
+            Ok(a) => a,
+            Err((status, msg)) => return text(status, msg),
+        },
+        (None, None) => return text(400, "missing addr or name"),
     };
 
-    let kind = match kind_str.unwrap_or("sw") {
+    let kind = match kind_str.as_deref().unwrap_or("sw") {
         "sw" | "software" => BpKind::Software,
         "hw" | "hardware" => {
-            let access = match parse_access(access_str.unwrap_or("exec")) {
+            let access = match parse_access(access_str.as_deref().unwrap_or("exec")) {
                 Some(a) => a,
                 None => return text(400, "invalid access"),
             };
@@ -504,7 +588,7 @@ fn handle_bp_set(process: &dyn Process, query: &str) -> Response<Body> {
             BpKind::Hardware { access, size }
         }
         "page" => {
-            let access = match parse_access(access_str.unwrap_or("any")) {
+            let access = match parse_access(access_str.as_deref().unwrap_or("any")) {
                 Some(a) => a,
                 None => return text(400, "invalid access"),
             };
@@ -531,6 +615,31 @@ fn handle_bp_set(process: &dyn Process, query: &str) -> Response<Body> {
         Err(BpError::NotFound) => text(404, "not found"),
         Err(BpError::Internal) => text(500, "internal error"),
     }
+}
+
+fn handle_symbol_resolve(process: &dyn Process, query: &str) -> Response<Body> {
+    let name = parse_query(query).find(|(k, _)| *k == "name").map(|(_, v)| v);
+    let Some(name) = name else {
+        return text(400, "missing name");
+    };
+    match resolve_symbol(process, &name) {
+        Ok(addr) => text(200, &format!("addr=0x{:x}\n", addr)),
+        Err((status, msg)) => text(status, msg),
+    }
+}
+
+fn resolve_symbol(process: &dyn Process, name: &str) -> Result<usize, (u16, &'static str)> {
+    let (module, symbol) = name
+        .split_once('!')
+        .ok_or((400, "name must be module!symbol"))?;
+    let exports = process
+        .module_exports(module)
+        .ok_or((404, "module not found"))?;
+    exports
+        .into_iter()
+        .find(|e| e.name == symbol)
+        .map(|e| e.addr)
+        .ok_or((404, "symbol not found"))
 }
 
 fn handle_bp_clear(process: &dyn Process, query: &str) -> Response<Body> {
@@ -610,11 +719,42 @@ fn split_query(url: &str) -> (&str, &str) {
     }
 }
 
-fn parse_query(q: &str) -> impl Iterator<Item = (&str, &str)> {
+fn parse_query(q: &str) -> impl Iterator<Item = (&str, String)> {
     q.split('&').filter(|s| !s.is_empty()).filter_map(|pair| {
         let (k, v) = pair.split_once('=')?;
-        Some((k, v))
+        Some((k, percent_decode(v)))
     })
+}
+
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' if i + 2 < bytes.len() => match (hex_nib(bytes[i + 1]), hex_nib(bytes[i + 2])) {
+                (Some(hi), Some(lo)) => {
+                    out.push((hi << 4) | lo);
+                    i += 3;
+                    continue;
+                }
+                _ => out.push(bytes[i]),
+            },
+            b'+' => out.push(b' '),
+            b => out.push(b),
+        }
+        i += 1;
+    }
+    String::from_utf8(out).unwrap_or_else(|e| String::from_utf8_lossy(&e.into_bytes()).into_owned())
+}
+
+fn hex_nib(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn parse_usize(s: &str) -> Option<usize> {

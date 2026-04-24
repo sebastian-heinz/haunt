@@ -1,5 +1,7 @@
 # haunt
 
+> 100% AI-developed.
+
 A minimal debugger-as-an-HTTP-server. Inject `haunt.dll` into a target
 Windows process, drive it from anywhere with `curl` or the `haunt` CLI.
 
@@ -59,18 +61,22 @@ haunt resume 1 --step
 End-to-end recipes that stitch the primitives together. All commands
 assume `HAUNT_URL` is set and the agent is running in the target.
 
-**Trace a function call and inspect arguments.** Set a breakpoint on
-entry, wait for it to hit, read the register snapshot, then let it
+**Trace a function call and inspect arguments.** Set a breakpoint by
+name, wait for it to hit, read the register snapshot, then let it
 continue.
 
 ```sh
-haunt exports kernel32.dll | grep CreateFileW
-haunt bp set 0x7FFD12340000 --kind sw
+haunt bp set kernel32.dll!CreateFileW --kind sw
 haunt wait                              # blocks until a thread halts
 haunt regs 3                            # hit_id from wait output; args in rcx/rdx/r8/r9
+haunt stack 3                           # backtrace with module!offset resolution
 haunt read 0x00000014FE3C0000 64        # dereference a pointer arg
 haunt resume 3
 ```
+
+`bp set` accepts either a hex address or `module!symbol`; the agent
+resolves the name server-side against its export tables. `haunt resolve
+module!symbol` returns the resolved address without setting anything.
 
 **Patch a return value without touching code.** Halt at the `ret`,
 overwrite `rax`, resume.
@@ -104,8 +110,21 @@ haunt bp list                           # hit counts per breakpoint
 
 ## Protocol
 
-All endpoints are plain HTTP/1.1. Auth is opt-in via `HAUNT_TOKEN`
-(`Authorization: Bearer <token>`). Bind defaults to `127.0.0.1:7878`.
+All endpoints are plain HTTP/1.1. The agent binds to `127.0.0.1:7878`
+(loopback only — not currently configurable). Auth is opt-in via
+`HAUNT_TOKEN`: set the variable in the **target process's** environment
+before injection, then pass it from the client via `Authorization:
+Bearer <token>`.
+
+To drive the agent from another machine, tunnel over SSH:
+
+```sh
+ssh -L 7878:127.0.0.1:7878 <target-host>
+HAUNT_URL=http://127.0.0.1:7878 haunt ping
+```
+
+This also encrypts the wire end-to-end — the protocol has no TLS of its
+own, and the bearer token would otherwise travel in cleartext.
 
 Memory:
 - `GET  /memory/read?addr=0x...&len=N[&format=hex|raw]`
@@ -113,7 +132,7 @@ Memory:
 - `GET  /memory/regions`
 
 Breakpoints:
-- `POST /bp/set?addr=0x...&kind=sw|hw|page[&access=x|w|rw|any][&size=N][&halt=true|false][&one_shot=true][&tid=N]`
+- `POST /bp/set?{addr=0x...|name=module!symbol}&kind=sw|hw|page[&access=x|w|rw|any][&size=N][&halt=true|false][&one_shot=true][&tid=N]`
 - `POST /bp/clear?id=N`
 - `GET  /bp/list`
 
@@ -121,6 +140,7 @@ Halts (parked threads):
 - `GET  /halts`
 - `GET  /halts/wait?timeout=<ms>`
 - `GET  /halts/<hit_id>`                       — register dump
+- `GET  /halts/<hit_id>/stack[?depth=N]`       — rbp-chain backtrace with `module+offset`
 - `POST /halts/<hit_id>/regs`                  — modify registers
 - `POST /halts/<hit_id>/resume?mode=continue|step|ret`
 
@@ -128,6 +148,7 @@ Introspection:
 - `GET  /modules`
 - `GET  /modules/<name>/exports`
 - `GET  /memory/regions`
+- `GET  /symbols/resolve?name=module!symbol`
 - `GET  /ping`  `GET  /version`  `POST /shutdown`
 
 ## Status
@@ -142,6 +163,10 @@ Introspection:
 - `panic = "abort"`; the agent is audited for unwrap/expect. Memory
   read/write uses `ReadProcessMemory`/`WriteProcessMemory` so invalid
   addresses surface as errors rather than crashing the host.
+- Stack walking is a plain rbp-chain walk, so it's reliable for code
+  with frame pointers and truncates early on release-mode Windows
+  binaries built with `/Oy` (which is most of them). A proper
+  `RtlVirtualUnwind`-based walker is on the roadmap.
 
 ## License
 
