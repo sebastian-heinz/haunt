@@ -7,6 +7,7 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 description = "Platform-agnostic core of haunt: HTTP protocol, breakpoint registry, trait interface."
+readme = "../../README.md"
 
 [dependencies]
 tiny_http = { version = "0.12", default-features = false }
