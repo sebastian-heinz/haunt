@@ -14,7 +14,7 @@ crates/
 ├── core/      haunt-core      platform-agnostic HTTP + protocol
 ├── windows/   haunt-windows   cdylib → haunt.dll
 ├── inject/    haunt-inject    CreateRemoteThread(LoadLibraryA)
-└── cli/       haunt-cli       haunt.exe
+└── cli/       haunt           haunt.exe
 ```
 
 ## Build
@@ -52,6 +52,54 @@ haunt bp set 0x7FF601234000 --kind sw
 haunt wait          # long-polls until a breakpoint halts a thread
 haunt regs 1        # hit_id
 haunt resume 1 --step
+```
+
+## Workflows
+
+End-to-end recipes that stitch the primitives together. All commands
+assume `HAUNT_URL` is set and the agent is running in the target.
+
+**Trace a function call and inspect arguments.** Set a breakpoint on
+entry, wait for it to hit, read the register snapshot, then let it
+continue.
+
+```sh
+haunt exports kernel32.dll | grep CreateFileW
+haunt bp set 0x7FFD12340000 --kind sw
+haunt wait                              # blocks until a thread halts
+haunt regs 3                            # hit_id from wait output; args in rcx/rdx/r8/r9
+haunt read 0x00000014FE3C0000 64        # dereference a pointer arg
+haunt resume 3
+```
+
+**Patch a return value without touching code.** Halt at the `ret`,
+overwrite `rax`, resume.
+
+```sh
+haunt bp set 0x7FF601234ABC --kind sw --one-shot
+haunt wait
+printf 'rax=0\n' | haunt setregs 7
+haunt resume 7
+```
+
+**Watch a field for writes.** Hardware breakpoint with `--access w`
+catches any thread modifying the address; breakpoints auto-propagate to
+new threads.
+
+```sh
+haunt bp set 0x00007FF6DEADBEEF --kind hw --access w --size 4
+haunt wait --timeout 60000
+haunt regs 12                           # rip points at the writing instruction
+haunt resume 12
+```
+
+**Non-halting tripwire.** `--no-halt` records hits without parking the
+thread — useful for sampling hot paths.
+
+```sh
+haunt bp set 0x7FF601234000 --kind sw --no-halt
+# ...let it run...
+haunt bp list                           # hit counts per breakpoint
 ```
 
 ## Protocol
