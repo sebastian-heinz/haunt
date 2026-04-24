@@ -37,10 +37,14 @@ jobs:
       - name: Set publish flags
         id: flags
         run: |
+          # --no-verify: the workspace default target is x86_64-pc-windows-gnu
+          # (for cross-compiling the agent DLL), which isn't installed on the
+          # Linux runner. Local dry-runs cover verification.
+          base="--no-verify"
           if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.dry_run }}" = "true" ]; then
-            echo "flags=--dry-run --allow-dirty" >> "$GITHUB_OUTPUT"
+            echo "flags=$base --dry-run --allow-dirty" >> "$GITHUB_OUTPUT"
           else
-            echo "flags=" >> "$GITHUB_OUTPUT"
+            echo "flags=$base" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Publish haunt-core
