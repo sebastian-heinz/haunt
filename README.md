@@ -1,0 +1,104 @@
+# haunt
+
+A minimal debugger-as-an-HTTP-server. Inject `haunt.dll` into a target
+Windows process, drive it from anywhere with `curl` or the `haunt` CLI.
+
+Memory read/write, software/hardware/page breakpoints, halt with register
+snapshot, resume/step/run-to-return — over a flat REST surface with no
+runtime dependencies on the target.
+
+## Layout
+
+```
+crates/
+├── core/      haunt-core      platform-agnostic HTTP + protocol
+├── windows/   haunt-windows   cdylib → haunt.dll
+├── inject/    haunt-inject    CreateRemoteThread(LoadLibraryA)
+└── cli/       haunt-cli       haunt.exe
+```
+
+## Build
+
+Requires Rust (`rustup`) and MinGW-w64 on macOS / Linux for cross-compile.
+
+```sh
+# macOS
+brew install mingw-w64
+
+# build everything for Windows x86_64
+./build.sh           # haunt.dll only
+cargo build --release   # all artifacts
+```
+
+Output ends up in `target/x86_64-pc-windows-gnu/release/`:
+
+- `haunt.dll` — the agent (~400 KB, system DLLs only, no MinGW runtime deps)
+- `haunt-inject.exe` — loader
+- `haunt.exe` — CLI client
+
+## Quick start
+
+On the Windows target, with all three binaries colocated:
+
+```sh
+haunt-inject --pid 1234 .\haunt.dll
+
+# same box, talk to the agent
+set HAUNT_URL=http://127.0.0.1:7878
+haunt ping
+haunt modules
+haunt exports kernel32.dll
+haunt bp set 0x7FF601234000 --kind sw
+haunt wait          # long-polls until a breakpoint halts a thread
+haunt regs 1        # hit_id
+haunt resume 1 --step
+```
+
+## Protocol
+
+All endpoints are plain HTTP/1.1. Auth is opt-in via `HAUNT_TOKEN`
+(`Authorization: Bearer <token>`). Bind defaults to `127.0.0.1:7878`.
+
+Memory:
+- `GET  /memory/read?addr=0x...&len=N[&format=hex|raw]`
+- `POST /memory/write?addr=0x...`  (raw body)
+- `GET  /memory/regions`
+
+Breakpoints:
+- `POST /bp/set?addr=0x...&kind=sw|hw|page[&access=x|w|rw|any][&size=N][&halt=true|false][&one_shot=true][&tid=N]`
+- `POST /bp/clear?id=N`
+- `GET  /bp/list`
+
+Halts (parked threads):
+- `GET  /halts`
+- `GET  /halts/wait?timeout=<ms>`
+- `GET  /halts/<hit_id>`                       — register dump
+- `POST /halts/<hit_id>/regs`                  — modify registers
+- `POST /halts/<hit_id>/resume?mode=continue|step|ret`
+
+Introspection:
+- `GET  /modules`
+- `GET  /modules/<name>/exports`
+- `GET  /memory/regions`
+- `GET  /ping`  `GET  /version`  `POST /shutdown`
+
+## Status
+
+- x86_64 Windows only for now. The `Process` trait is platform-agnostic;
+  a Linux implementation is on the roadmap.
+- Breakpoint kinds: software (`int3`), hardware (DR0–DR3), page
+  (PAGE_GUARD).
+- Hardware breakpoints propagate to new threads via `DLL_THREAD_ATTACH`
+  (uses `SetThreadContext` on self — documented-fragile but empirically
+  reliable on modern Windows).
+- `panic = "abort"`; the agent is audited for unwrap/expect. Memory
+  read/write uses `ReadProcessMemory`/`WriteProcessMemory` so invalid
+  addresses surface as errors rather than crashing the host.
+
+## License
+
+AGPL-3.0. See [LICENSE](LICENSE).
+
+If you want to use haunt in a closed-source or SaaS product without
+publishing your modifications, you'll need a different arrangement —
+open an issue.

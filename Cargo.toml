@@ -1,0 +1,26 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+    "crates/windows",
+    "crates/inject",
+    "crates/cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+license = "AGPL-3.0-only"
+repository = "https://github.com/sebastian-heinz/haunt"
+homepage = "https://github.com/sebastian-heinz/haunt"
+
+[workspace.dependencies]
+haunt-core = { path = "crates/core" }
+
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true

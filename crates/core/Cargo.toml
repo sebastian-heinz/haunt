@@ -1,0 +1,12 @@
+[package]
+name = "haunt-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Platform-agnostic core of haunt: HTTP protocol, breakpoint registry, trait interface."
+
+[dependencies]
+tiny_http = { version = "0.12", default-features = false }
