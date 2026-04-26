@@ -11,19 +11,14 @@ pub const INT3: u8 = 0xCC;
 
 pub struct State {
     pub original_byte: u8,
+    /// `false` while the original byte is currently in memory (we're between
+    /// int3 hit and single-step rearm). Lets the VEH avoid restoring twice.
     pub active: bool,
 }
 
 pub fn install(addr: usize) -> Result<State, BpError> {
     let original = unsafe { write_byte(addr, INT3) }.map_err(|_| BpError::Unwritable)?;
     Ok(State { original_byte: original, active: true })
-}
-
-pub fn uninstall(addr: usize, state: State) -> Result<(), BpError> {
-    if state.active {
-        unsafe { write_byte(addr, state.original_byte) }.map_err(|_| BpError::Internal)?;
-    }
-    Ok(())
 }
 
 pub unsafe fn write_byte(addr: usize, byte: u8) -> Result<u8, ()> {

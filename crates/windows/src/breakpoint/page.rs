@@ -6,7 +6,7 @@
 use std::mem::{size_of, MaybeUninit};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use haunt_core::{BpAccess, BpError};
+use haunt_core::{warn, BpAccess, BpError};
 
 // `access` is accepted for the public API symmetry with hardware BPs but PAGE_GUARD
 // can only fire on any access, so the value is discarded.
@@ -18,12 +18,11 @@ use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
 
 pub struct State {
     pub pages: Vec<(usize, u32)>, // (page_base, original_protect)
-    pub active: bool,
 }
 
 static PAGE_SIZE: AtomicUsize = AtomicUsize::new(0);
 
-fn page_size() -> usize {
+pub fn page_size() -> usize {
     let cached = PAGE_SIZE.load(Ordering::Relaxed);
     if cached != 0 {
         return cached;
@@ -34,6 +33,12 @@ fn page_size() -> usize {
     let sz = if sz == 0 { 4096 } else { sz };
     PAGE_SIZE.store(sz, Ordering::Relaxed);
     sz
+}
+
+/// Page base containing `addr`.
+pub fn page_base(addr: usize) -> usize {
+    let ps = page_size();
+    addr & !(ps - 1)
 }
 
 pub fn install(addr: usize, _access: BpAccess, size: usize) -> Result<State, BpError> {
@@ -47,26 +52,29 @@ pub fn install(addr: usize, _access: BpAccess, size: usize) -> Result<State, BpE
     while cursor < end_page {
         let original = query_protect(cursor).ok_or(BpError::Unwritable)?;
         if unsafe { set_protect(cursor, ps, original | PAGE_GUARD) }.is_err() {
-            // Roll back anything we've already armed.
+            warn!("page bp install: VirtualProtect(0x{cursor:x}) failed; rolling back");
             for (p, orig) in pages {
-                let _ = unsafe { set_protect(p, ps, orig) };
+                if unsafe { set_protect(p, ps, orig) }.is_err() {
+                    warn!("page bp install rollback: VirtualProtect(0x{p:x}) failed; page left unprotected");
+                }
             }
             return Err(BpError::Unwritable);
         }
         pages.push((cursor, original));
         cursor += ps;
     }
-    Ok(State { pages, active: true })
+    Ok(State { pages })
 }
 
-pub fn uninstall(state: State) -> Result<(), BpError> {
-    if !state.active {
-        return Ok(());
-    }
+/// Restore the original protection on each page, leaving the registry entry
+/// untouched. Used by `clear()` to drop PAGE_GUARD before removing the entry,
+/// closing the race where on_guard_page would find no matching entry.
+pub fn restore(pages: &[(usize, u32)]) -> Result<(), BpError> {
     let ps = page_size();
     let mut overall = Ok(());
-    for (base, original) in state.pages {
+    for &(base, original) in pages {
         if unsafe { set_protect(base, ps, original) }.is_err() {
+            warn!("page bp restore: VirtualProtect(0x{base:x}) failed; page state inconsistent");
             overall = Err(BpError::Internal);
         }
     }
@@ -74,7 +82,9 @@ pub fn uninstall(state: State) -> Result<(), BpError> {
 }
 
 pub fn rearm(base: usize, original_protect: u32) {
-    let _ = unsafe { set_protect(base, page_size(), original_protect | PAGE_GUARD) };
+    if unsafe { set_protect(base, page_size(), original_protect | PAGE_GUARD) }.is_err() {
+        warn!("page bp rearm: VirtualProtect(0x{base:x}) failed; bp will not fire again");
+    }
 }
 
 /// Find the page BP containing `addr`. Returns (page_base, original_protect).

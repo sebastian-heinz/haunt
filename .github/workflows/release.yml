@@ -21,8 +21,28 @@ jobs:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu, i686-pc-windows-gnu
 
       - uses: Swatinem/rust-cache@v2
+
+      - name: Install MinGW-w64 (x64 + x86)
+        # Required for cross-compiling the Windows targets in the sanity
+        # build step below. `cargo publish --no-verify` would otherwise
+        # ship a commit that doesn't actually build for the workspace's
+        # default target.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-mingw-w64-x86-64 gcc-mingw-w64-i686
+
+      - name: Sanity build (cross-compile guard for crates.io)
+        # The publish steps below pass `--no-verify` because crates.io's
+        # build environment can't compile to x86_64-pc-windows-gnu. Build
+        # both bitnesses ourselves first so a publishable-but-broken
+        # commit fails CI rather than failing for users on `cargo install`.
+        run: |
+          cargo build --release --target x86_64-pc-windows-gnu
+          cargo build --release --target i686-pc-windows-gnu -p haunt-windows -p haunt-inject
 
       - name: Verify tag matches Cargo.toml version
         if: startsWith(github.ref, 'refs/tags/v')
