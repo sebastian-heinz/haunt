@@ -6,7 +6,20 @@
 pub mod dsl;
 pub mod events;
 pub mod log;
+pub mod logs;
 pub mod thread_role;
+
+// MinGW i686 + panic=abort still references `_Unwind_Resume` from stdlib's
+// alloc; libgcc_eh doesn't resolve it under static linking. Stub it here
+// (panic=abort already guarantees any unwind path ends in process abort)
+// so every haunt-core consumer — the cdylib agent, the injector, any
+// future binary — picks up one definition through the normal dependency
+// graph instead of hand-rolling the same stub per crate.
+#[cfg(all(target_arch = "x86", target_env = "gnu"))]
+#[no_mangle]
+pub extern "C" fn _Unwind_Resume() -> ! {
+    std::process::abort()
+}
 
 use std::io::Read;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -18,6 +31,22 @@ use tiny_http::{Header, Method, Request, Response, Server};
 pub const DEFAULT_BIND: &str = "127.0.0.1:7878";
 pub const MAX_READ_LEN: usize = 16 * 1024 * 1024;
 pub const MAX_WRITE_LEN: usize = 16 * 1024 * 1024;
+/// Hard cap on `POST /halts/<id>/regs` body. A real patch is dozens of
+/// bytes (one `name=value` line per register, ≤18 registers). 64 KB is
+/// well above any plausible scripted use; anything larger is either
+/// abuse or a runaway script. Without a cap the handler's
+/// `read_to_string` would allocate without bound and `panic = "abort"`
+/// would turn an OOM into a host kill.
+pub const MAX_REGS_BODY: usize = 64 * 1024;
+
+/// Hard cap on every long-poll endpoint's `timeout` parameter
+/// (`/halts/wait`, `/events`). A client sending `?timeout=u64::MAX`
+/// would otherwise pin an agent worker thread for ~584 million years.
+/// Defended at the HTTP edge in `handle_halts_wait` / `handle_events`,
+/// and again in the platform-side `wait_halt` / `events::poll` impls
+/// — defending at both layers is cheap and means a buggy direct
+/// `events::poll` caller can't bypass the edge clamp.
+pub const MAX_LONG_POLL_TIMEOUT_MS: u64 = 60_000;
 
 /// Hard cap on total concurrent worker threads. Each request runs on its
 /// own worker (~1 MB stack VM on Windows x64); the long-poll endpoints
@@ -93,10 +122,12 @@ pub enum BpError {
     NoHwSlot,
     NotFound,
     Internal,
-    /// A breakpoint already exists at the requested address. Permitting two
-    /// SW breakpoints at the same address would silently corrupt the
-    /// `original_byte` tracking in the second install (it would read the
-    /// `0xCC` placed by the first and remember that as the original).
+    /// Conflict at the requested address: either another haunt breakpoint
+    /// already covers it, or the byte already contains `0xCC` (a
+    /// compiler-emitted `int 3`, a third-party hook, etc.). Either case
+    /// would corrupt `original_byte` tracking — the install would read
+    /// `0xCC` and remember it as the original, then on the first hit
+    /// restore `0xCC`, re-trigger the int3, and infinite-loop.
     Conflict,
 }
 
@@ -112,7 +143,11 @@ pub enum BpAccess {
 pub enum BpKind {
     Software,
     Hardware { access: BpAccess, size: u8 },
-    Page { access: BpAccess, size: usize },
+    /// `PAGE_GUARD` (or platform equivalent) over a range of pages. Fires on
+    /// any access kind — there is no read/write/exec selectivity at the page
+    /// granularity, unlike `Hardware`. The HTTP layer rejects `access=` for
+    /// `kind=page` rather than silently ignoring it.
+    Page { size: usize },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -199,6 +234,79 @@ pub struct Registers {
     pub r12: u64, pub r13: u64, pub r14: u64, pub r15: u64,
     pub rip: u64,
     pub eflags: u32,
+}
+
+/// Identifies a single register slot in `Registers`. Used by `halt_set_regs`
+/// so partial edits (the common case — patch one field, leave the rest) can
+/// merge into the parked thread's saved CONTEXT instead of clobbering it.
+///
+/// Names are unified across x64 and x86: `Rax` covers both `rax` and `eax`,
+/// `Rip` covers both `rip` and `eip`, etc. The platform layer projects
+/// these onto whichever CONTEXT field exists for the agent's bitness.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RegName {
+    Rax, Rcx, Rdx, Rbx,
+    Rsp, Rbp, Rsi, Rdi,
+    R8, R9, R10, R11, R12, R13, R14, R15,
+    Rip,
+    Eflags,
+}
+
+impl RegName {
+    /// Parse a register name from either the x64 (`rax`, `rip`) or x86
+    /// (`eax`, `eip`) spelling. The unified eight 32-bit names map to the
+    /// corresponding `R*` slot. Unknown names return `None` so the caller
+    /// can surface "no such register: foo" instead of silently dropping
+    /// the edit.
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "rax" | "eax" => Self::Rax,
+            "rcx" | "ecx" => Self::Rcx,
+            "rdx" | "edx" => Self::Rdx,
+            "rbx" | "ebx" => Self::Rbx,
+            "rsp" | "esp" => Self::Rsp,
+            "rbp" | "ebp" => Self::Rbp,
+            "rsi" | "esi" => Self::Rsi,
+            "rdi" | "edi" => Self::Rdi,
+            "r8"  => Self::R8,
+            "r9"  => Self::R9,
+            "r10" => Self::R10,
+            "r11" => Self::R11,
+            "r12" => Self::R12,
+            "r13" => Self::R13,
+            "r14" => Self::R14,
+            "r15" => Self::R15,
+            "rip" | "eip" => Self::Rip,
+            "eflags" => Self::Eflags,
+            _ => return None,
+        })
+    }
+
+    /// Apply this register's slot in `regs` to `value`. Used by the
+    /// platform-side merge that turns a partial patch into a full
+    /// `Registers` snapshot before resuming the parked thread.
+    pub fn write(self, regs: &mut Registers, value: u64) {
+        match self {
+            Self::Rax => regs.rax = value,
+            Self::Rcx => regs.rcx = value,
+            Self::Rdx => regs.rdx = value,
+            Self::Rbx => regs.rbx = value,
+            Self::Rsp => regs.rsp = value,
+            Self::Rbp => regs.rbp = value,
+            Self::Rsi => regs.rsi = value,
+            Self::Rdi => regs.rdi = value,
+            Self::R8  => regs.r8  = value,
+            Self::R9  => regs.r9  = value,
+            Self::R10 => regs.r10 = value,
+            Self::R11 => regs.r11 = value,
+            Self::R12 => regs.r12 = value,
+            Self::R13 => regs.r13 = value,
+            Self::R14 => regs.r14 = value,
+            Self::R15 => regs.r15 = value,
+            Self::Rip => regs.rip = value,
+            Self::Eflags => regs.eflags = value as u32,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -293,7 +401,11 @@ pub trait Process: Send + Sync {
     /// halt (or any new one that arrives during the wait).
     fn wait_halt(&self, timeout_ms: u64, since: u64) -> Option<HaltSummary>;
     fn halt_regs(&self, hit_id: u64) -> Option<Registers>;
-    fn halt_set_regs(&self, hit_id: u64, regs: Registers) -> Result<(), BpError>;
+    /// Apply a partial register patch to the parked thread's saved CONTEXT.
+    /// Each `(name, value)` pair overwrites exactly one slot; every other
+    /// register keeps its captured-at-halt value. Returns `NotFound` if
+    /// `hit_id` is not parked.
+    fn halt_set_regs(&self, hit_id: u64, patch: &[(RegName, u64)]) -> Result<(), BpError>;
     fn halt_resume(&self, hit_id: u64, mode: ResumeMode) -> Result<(), BpError>;
 
     fn modules(&self) -> Vec<ModuleInfo>;
@@ -403,7 +515,12 @@ pub fn run(process: Arc<dyn Process>, config: Config) {
         let process = Arc::clone(&process);
         let server = Arc::clone(&server);
         let token = Arc::clone(&token);
-        std::thread::spawn(move || {
+        // `std::thread::spawn` is `Builder::new().spawn().unwrap()`, which
+        // panics on thread-creation failure (kernel handle/quota exhaustion,
+        // low memory, etc.). Under `panic = "abort"` that kills the host.
+        // Use `Builder::spawn` and recover by responding 503 + releasing
+        // the slot.
+        let spawn_result = std::thread::Builder::new().spawn(move || {
             // Hold the slot for the lifetime of this worker; Drop releases
             // it whether we return normally or the worker thread is torn
             // down. Move (not borrow) into the closure.
@@ -421,6 +538,15 @@ pub fn run(process: Arc<dyn Process>, config: Config) {
             );
             let _ = request.respond(response);
         });
+        if let Err(e) = spawn_result {
+            // The closure was dropped on Err, taking the request, slot, and
+            // arcs with it. The slot guard's Drop already decremented the
+            // counter; we just have to log and move on. The client sees a
+            // dropped TCP connection (tiny_http reaps the request when the
+            // closure drops), which is the same outcome as a 503 from the
+            // pool-exhaustion path.
+            warn!("worker spawn failed: {e}; dropping request");
+        }
     }
     info!("http server stopped");
 }
@@ -457,7 +583,7 @@ fn classify_request(method: &Method, url: &str) -> SlotKind {
         None => url,
     };
     match path {
-        "/halts/wait" | "/events" => SlotKind::LongPoll,
+        "/halts/wait" | "/events" | "/logs" => SlotKind::LongPoll,
         _ => SlotKind::Short,
     }
 }
@@ -544,6 +670,7 @@ fn route(
         (Method::Get, "/symbols/resolve") => Some(handle_symbol_resolve(process, query)),
         (Method::Get, "/symbols/lookup") => Some(handle_symbol_lookup(process, query)),
         (Method::Get, "/events") => Some(handle_events(query)),
+        (Method::Get, "/logs") => Some(handle_logs(query)),
         (Method::Get, "/halts") => Some(handle_halts_list(process)),
         (Method::Get, "/halts/wait") => Some(handle_halts_wait(process, query)),
         (Method::Get, "/modules") => Some(handle_modules(process)),
@@ -559,6 +686,7 @@ fn route(
             // each; set flag" sequence had exactly that gap).
             process.shutdown_halts();
             events::shutdown();
+            logs::shutdown();
             server.unblock();
             text(200, "shutting down")
         }),
@@ -618,22 +746,31 @@ fn handle_halt_sub(
         },
         (Method::Get, "stack") => handle_halt_stack(process, hit_id, query),
         (Method::Post, "regs") => {
+            // Cap the body so a malicious or buggy client can't OOM-abort the
+            // host with a multi-GB POST. A real setregs body is dozens of
+            // bytes; 64 KB is generous enough for any plausible scripted use.
             let mut body = String::new();
-            if req.as_reader().read_to_string(&mut body).is_err() {
+            if req.as_reader().take(MAX_REGS_BODY as u64 + 1).read_to_string(&mut body).is_err() {
                 return text(400, "body read error");
             }
-            let regs = match parse_regs(&body) {
-                Some(r) => r,
-                None => return text(400, "invalid regs body"),
+            if body.len() > MAX_REGS_BODY {
+                return text(400, "body too large");
+            }
+            let patch = match parse_regs(&body) {
+                Ok(p) => p,
+                Err(e) => return text(400, &e),
             };
-            match process.halt_set_regs(hit_id, regs) {
+            match process.halt_set_regs(hit_id, &patch) {
                 Ok(()) => text(200, "ok"),
                 Err(BpError::NotFound) => text(404, "not found"),
                 _ => text(500, "internal"),
             }
         }
         (Method::Post, "resume") => {
-            let mode = parse_resume_mode(query).unwrap_or(ResumeMode::Continue);
+            let mode = match parse_resume_mode(query) {
+                Ok(m) => m,
+                Err(e) => return text(400, &e),
+            };
             match process.halt_resume(hit_id, mode) {
                 Ok(()) => text(200, "resumed"),
                 Err(BpError::NotFound) => text(404, "not found"),
@@ -648,11 +785,20 @@ const STACK_DEFAULT_DEPTH: usize = 32;
 const STACK_MAX_DEPTH: usize = 256;
 
 fn handle_halt_stack(process: &dyn Process, hit_id: u64, query: &str) -> Response<Body> {
-    let depth = parse_query(query)
-        .find(|(k, _)| *k == "depth")
-        .and_then(|(_, v)| v.parse::<usize>().ok())
-        .unwrap_or(STACK_DEFAULT_DEPTH)
-        .clamp(1, STACK_MAX_DEPTH);
+    // Distinguish missing (use default) from present-but-invalid (400). The
+    // previous `unwrap_or(default)` swallowed parse errors silently so a
+    // typo like `?depth=abc` gave a 32-frame walk when the user meant `256`,
+    // with no signal that the limit fell back.
+    let mut depth = STACK_DEFAULT_DEPTH;
+    for (k, v) in parse_query(query) {
+        if k == "depth" {
+            match v.parse::<usize>() {
+                Ok(n) => depth = n,
+                Err(_) => return text(400, "depth: not a number"),
+            }
+        }
+    }
+    let depth = depth.clamp(1, STACK_MAX_DEPTH);
 
     let frames = process.stack_walk(hit_id, depth);
     if frames.is_empty() {
@@ -688,15 +834,24 @@ fn resolve_addr(modules: &[ModuleInfo], addr: u64) -> Option<(&str, usize)> {
     })
 }
 
-fn parse_resume_mode(query: &str) -> Option<ResumeMode> {
-    parse_query(query)
-        .find(|(k, _)| *k == "mode")
-        .and_then(|(_, v)| match v.as_str() {
-            "continue" => Some(ResumeMode::Continue),
-            "step" => Some(ResumeMode::Step),
-            "ret" => Some(ResumeMode::Ret),
-            _ => None,
-        })
+/// Parse `?mode=` for the resume endpoint. Distinguishes the two failure
+/// modes the previous `Option` collapsed:
+/// - `Ok(Continue)` when no `mode` param was supplied — the documented
+///   default.
+/// - `Err(_)` when `mode` was present but unrecognised — a typo like
+///   `?mode=stp` (instead of `step`) used to silently `Continue`, which
+///   meant the user thought they single-stepped while the thread ran free.
+fn parse_resume_mode(query: &str) -> Result<ResumeMode, String> {
+    let raw = parse_query(query).find(|(k, _)| *k == "mode").map(|(_, v)| v);
+    match raw.as_deref() {
+        None => Ok(ResumeMode::Continue),
+        Some("continue") => Ok(ResumeMode::Continue),
+        Some("step") => Ok(ResumeMode::Step),
+        Some("ret") => Ok(ResumeMode::Ret),
+        Some(other) => Err(format!(
+            "mode: expected continue|step|ret, got `{other}`"
+        )),
+    }
 }
 
 fn handle_info(process: &dyn Process) -> Response<Body> {
@@ -771,13 +926,22 @@ fn handle_memory_search(process: &dyn Process, query: &str) -> Response<Body> {
         match k {
             "pattern" => pattern_str = Some(v),
             "module" => module = Some(v),
-            "start" => start = parse_usize(&v),
-            "end" => end = parse_usize(&v),
+            "start" => match parse_usize(&v) {
+                Some(a) => start = Some(a),
+                None => return text(400, "start: not a number"),
+            },
+            "end" => match parse_usize(&v) {
+                Some(a) => end = Some(a),
+                None => return text(400, "end: not a number"),
+            },
             "all" => match parse_bool(&v) {
                 Some(b) => all = b,
                 None => return text(400, "all: expected true/false"),
             },
-            "limit" => limit = v.parse::<usize>().unwrap_or(256).clamp(1, 4096),
+            "limit" => match v.parse::<usize>() {
+                Ok(n) => limit = n.clamp(1, 4096),
+                Err(_) => return text(400, "limit: not a number"),
+            },
             _ => {}
         }
     }
@@ -845,13 +1009,6 @@ fn handle_halts_list(process: &dyn Process) -> Response<Body> {
     text(200, &body)
 }
 
-/// Hard cap on `/halts/wait` timeout. `events::poll` enforces the same
-/// number internally; mirror it at the HTTP edge so a malicious client
-/// can't pin an agent worker thread for billions of years by sending
-/// `?timeout=u64::MAX`. The platform `wait_halt` impl is also expected to
-/// clamp, but defending at both layers is cheap.
-const MAX_WAIT_TIMEOUT_MS: u64 = 60_000;
-
 fn handle_halts_wait(process: &dyn Process, query: &str) -> Response<Body> {
     let mut timeout: u64 = 30_000;
     let mut since: u64 = 0;
@@ -868,7 +1025,7 @@ fn handle_halts_wait(process: &dyn Process, query: &str) -> Response<Body> {
             _ => {}
         }
     }
-    let timeout = timeout.min(MAX_WAIT_TIMEOUT_MS);
+    let timeout = timeout.min(MAX_LONG_POLL_TIMEOUT_MS);
     match process.wait_halt(timeout, since) {
         Some(h) => text(200, &format_halt(&h)),
         None => text(204, ""),
@@ -902,38 +1059,34 @@ fn format_regs(r: &Registers, modules: &[ModuleInfo]) -> String {
     s
 }
 
-fn parse_regs(body: &str) -> Option<Registers> {
-    let mut r = Registers::default();
-    for line in body.lines() {
-        let line = line.trim();
+/// Parse a `setregs` body into a list of `(register, new_value)` patches.
+/// One line per register. Either x64 (`rax=...`) or x86 (`eax=...`) names
+/// are accepted and unified by `RegName::parse`.
+///
+/// Errors:
+/// - any line missing `=`
+/// - any value that doesn't parse as decimal or `0x`-prefixed hex
+/// - any unknown register name (so a typo like `rxx=0` is surfaced rather
+///   than silently dropped — the previous behaviour combined with a blind
+///   overwrite turned typos into target-process crashes)
+fn parse_regs(body: &str) -> Result<Vec<(RegName, u64)>, String> {
+    let mut out = Vec::new();
+    for (lineno, raw) in body.lines().enumerate() {
+        let line = raw.trim();
         if line.is_empty() {
             continue;
         }
-        let (name, value) = line.split_once('=')?;
-        let value = parse_u64(value.trim())?;
-        match name.trim() {
-            "rax" => r.rax = value,
-            "rcx" => r.rcx = value,
-            "rdx" => r.rdx = value,
-            "rbx" => r.rbx = value,
-            "rsp" => r.rsp = value,
-            "rbp" => r.rbp = value,
-            "rsi" => r.rsi = value,
-            "rdi" => r.rdi = value,
-            "r8" => r.r8 = value,
-            "r9" => r.r9 = value,
-            "r10" => r.r10 = value,
-            "r11" => r.r11 = value,
-            "r12" => r.r12 = value,
-            "r13" => r.r13 = value,
-            "r14" => r.r14 = value,
-            "r15" => r.r15 = value,
-            "rip" => r.rip = value,
-            "eflags" => r.eflags = value as u32,
-            _ => {}
-        }
+        let (name, value) = line
+            .split_once('=')
+            .ok_or_else(|| format!("line {}: expected `name=value`", lineno + 1))?;
+        let name = name.trim();
+        let value = parse_u64(value.trim())
+            .ok_or_else(|| format!("line {}: bad value for {name}", lineno + 1))?;
+        let reg = RegName::parse(name)
+            .ok_or_else(|| format!("line {}: unknown register `{name}`", lineno + 1))?;
+        out.push((reg, value));
     }
-    Some(r)
+    Ok(out)
 }
 
 fn parse_u64(s: &str) -> Option<u64> {
@@ -1025,8 +1178,14 @@ fn handle_read(process: &dyn Process, query: &str) -> Response<Body> {
     let mut raw = false;
     for (k, v) in parse_query(query) {
         match k {
-            "addr" => addr = parse_usize(&v),
-            "len" => len = parse_usize(&v),
+            "addr" => match parse_usize(&v) {
+                Some(a) => addr = Some(a),
+                None => return text(400, "addr: not a number"),
+            },
+            "len" => match parse_usize(&v) {
+                Some(a) => len = Some(a),
+                None => return text(400, "len: not a number"),
+            },
             "format" => raw = v == "raw",
             _ => {}
         }
@@ -1055,9 +1214,15 @@ fn handle_read(process: &dyn Process, query: &str) -> Response<Body> {
 }
 
 fn handle_write(process: &dyn Process, query: &str, req: &mut Request) -> Response<Body> {
-    let addr = parse_query(query)
-        .find(|(k, _)| *k == "addr")
-        .and_then(|(_, v)| parse_usize(&v));
+    let mut addr: Option<usize> = None;
+    for (k, v) in parse_query(query) {
+        if k == "addr" {
+            match parse_usize(&v) {
+                Some(a) => addr = Some(a),
+                None => return text(400, "addr: not a number"),
+            }
+        }
+    }
     let Some(addr) = addr else {
         return text(400, "missing addr");
     };
@@ -1130,12 +1295,25 @@ fn handle_bp_set(process: &dyn Process, query: &str) -> Response<Body> {
         (None, None) => return text(400, "missing addr or name"),
     };
 
+    // Reject access/size against kind=sw up front. Without this, a user who
+    // intends a hardware write watchpoint and types
+    // `bp set 0x... --access w --size 4` would silently get a software int3
+    // because `--kind` defaults to `sw` and the hw-only flags were dropped
+    // on the floor.
     let kind = match kind_str.as_deref().unwrap_or("sw") {
-        "sw" | "software" => BpKind::Software,
+        "sw" | "software" => {
+            if access_str.is_some() {
+                return text(400, "access is only valid with kind=hw or kind=page");
+            }
+            if size_u.is_some() {
+                return text(400, "size is only valid with kind=hw or kind=page");
+            }
+            BpKind::Software
+        }
         "hw" | "hardware" => {
             let access = match parse_access(access_str.as_deref().unwrap_or("exec")) {
                 Some(a) => a,
-                None => return text(400, "invalid access"),
+                None => return text(400, "access: expected x|exec|w|write|rw|readwrite|any"),
             };
             let size = size_u.unwrap_or(1) as u8;
             if !matches!(size, 1 | 2 | 4 | 8) {
@@ -1144,15 +1322,18 @@ fn handle_bp_set(process: &dyn Process, query: &str) -> Response<Body> {
             BpKind::Hardware { access, size }
         }
         "page" => {
-            let access = match parse_access(access_str.as_deref().unwrap_or("any")) {
-                Some(a) => a,
-                None => return text(400, "invalid access"),
-            };
+            // PAGE_GUARD fires on any access kind; there's no per-kind
+            // selectivity at the page granularity. Reject `access=` rather
+            // than silently treating it as "any" — a user intending only
+            // writes would otherwise see hits on every read and execute too.
+            if access_str.is_some() {
+                return text(400, "access is not supported with kind=page (PAGE_GUARD fires on any access)");
+            }
             let size = size_u.unwrap_or(1);
             if size == 0 {
                 return text(400, "size must be > 0");
             }
-            BpKind::Page { access, size }
+            BpKind::Page { size }
         }
         _ => return text(400, "invalid kind"),
     };
@@ -1185,11 +1366,11 @@ fn handle_bp_set(process: &dyn Process, query: &str) -> Response<Body> {
         // exports (kernel32!ExitProcess → ntdll!RtlExitUserProcess) make
         // this non-obvious; without the echo the user has to cross-check
         // against `haunt resolve`.
-        Ok(id) => text(200, &format!("id={} addr=0x{:x}", id.0, addr)),
+        Ok(id) => text(200, &format!("id={} addr=0x{:x}\n", id.0, addr)),
         Err(BpError::Unsupported) => text(400, "unsupported combination"),
         Err(BpError::Unwritable) => text(403, "unwritable"),
         Err(BpError::NoHwSlot) => text(409, "no hardware slot"),
-        Err(BpError::Conflict) => text(409, "breakpoint already exists at this address"),
+        Err(BpError::Conflict) => text(409, "address conflicts with an existing breakpoint, a pre-existing 0xCC byte, or a page that already has PAGE_GUARD set"),
         Err(BpError::NotFound) => text(404, "not found"),
         Err(BpError::Internal) => text(500, "internal error"),
     }
@@ -1207,9 +1388,15 @@ fn handle_symbol_resolve(process: &dyn Process, query: &str) -> Response<Body> {
 }
 
 fn handle_symbol_lookup(process: &dyn Process, query: &str) -> Response<Body> {
-    let addr = parse_query(query)
-        .find(|(k, _)| *k == "addr")
-        .and_then(|(_, v)| parse_usize(&v));
+    let mut addr: Option<usize> = None;
+    for (k, v) in parse_query(query) {
+        if k == "addr" {
+            match parse_usize(&v) {
+                Some(a) => addr = Some(a),
+                None => return text(400, "addr: not a number"),
+            }
+        }
+    }
     let Some(addr) = addr else {
         return text(400, "missing addr");
     };
@@ -1234,9 +1421,15 @@ fn resolve_symbol(process: &dyn Process, name: &str) -> Result<usize, (u16, &'st
 }
 
 fn handle_bp_clear(process: &dyn Process, query: &str) -> Response<Body> {
-    let id = parse_query(query)
-        .find(|(k, _)| *k == "id")
-        .and_then(|(_, v)| v.parse::<u64>().ok());
+    let mut id: Option<u64> = None;
+    for (k, v) in parse_query(query) {
+        if k == "id" {
+            match v.parse::<u64>() {
+                Ok(n) => id = Some(n),
+                Err(_) => return text(400, "id: not a number"),
+            }
+        }
+    }
     let Some(id) = id else {
         return text(400, "missing id");
     };
@@ -1286,15 +1479,57 @@ fn format_bp(bp: &BreakpointInfo) -> String {
     s
 }
 
+fn handle_logs(query: &str) -> Response<Body> {
+    let mut since: u64 = 0;
+    let mut limit: usize = 256;
+    let mut timeout: u64 = 0;
+    for (k, v) in parse_query(query) {
+        match k {
+            "since" => match v.parse::<u64>() {
+                Ok(n) => since = n,
+                Err(_) => return text(400, "since: not a number"),
+            },
+            "limit" => match v.parse::<usize>() {
+                Ok(n) => limit = n.clamp(1, 4096),
+                Err(_) => return text(400, "limit: not a number"),
+            },
+            "timeout" => match v.parse::<u64>() {
+                Ok(n) => timeout = n,
+                Err(_) => return text(400, "timeout: not a number"),
+            },
+            _ => {}
+        }
+    }
+    let records = logs::poll(since, limit, timeout);
+    let mut body = String::new();
+    for r in records {
+        body.push_str(&format!(
+            "id={} t={}ms level={} tid={} msg={}\n",
+            r.id, r.millis, r.level.as_str(), r.tid,
+            quote_msg(&r.msg),
+        ));
+    }
+    text(200, &body)
+}
+
 fn handle_events(query: &str) -> Response<Body> {
     let mut since: u64 = 0;
     let mut limit: usize = 256;
     let mut timeout: u64 = 0;
     for (k, v) in parse_query(query) {
         match k {
-            "since" => since = v.parse().unwrap_or(0),
-            "limit" => limit = v.parse::<usize>().unwrap_or(256).clamp(1, 4096),
-            "timeout" => timeout = v.parse().unwrap_or(0),
+            "since" => match v.parse::<u64>() {
+                Ok(n) => since = n,
+                Err(_) => return text(400, "since: not a number"),
+            },
+            "limit" => match v.parse::<usize>() {
+                Ok(n) => limit = n.clamp(1, 4096),
+                Err(_) => return text(400, "limit: not a number"),
+            },
+            "timeout" => match v.parse::<u64>() {
+                Ok(n) => timeout = n,
+                Err(_) => return text(400, "timeout: not a number"),
+            },
             _ => {}
         }
     }
@@ -1331,12 +1566,18 @@ fn quote_msg(s: &str) -> String {
     out
 }
 
+/// Accepted spellings, matching the README/USAGE-documented surface:
+///   x|exec  w|write  rw|readwrite  any
+/// The previously-undocumented `r` alias for `Any` is removed — a user
+/// reading `r` as "read-only" was getting any-access behaviour silently,
+/// which mismatched both the documented vocabulary and Intel SDM HW BP
+/// semantics (no read-only watchpoint exists at the hardware level).
 fn parse_access(s: &str) -> Option<BpAccess> {
     match s {
         "exec" | "x" => Some(BpAccess::Execute),
         "write" | "w" => Some(BpAccess::Write),
         "rw" | "readwrite" => Some(BpAccess::ReadWrite),
-        "any" | "r" => Some(BpAccess::Any),
+        "any" => Some(BpAccess::Any),
         _ => None,
     }
 }
@@ -1355,8 +1596,8 @@ fn format_kind(k: &BpKind) -> String {
         BpKind::Hardware { access, size } => {
             format!("hw/{}/size={}", access_str(*access), size)
         }
-        BpKind::Page { access, size } => {
-            format!("page/{}/size={}", access_str(*access), size)
+        BpKind::Page { size } => {
+            format!("page/size={size}")
         }
     }
 }
@@ -1469,6 +1710,78 @@ fn hex_encode(bytes: &[u8]) -> String {
 
 fn text(status: u16, body: &str) -> Response<Body> {
     Response::from_string(body).with_status_code(status)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_regs_accepts_x64_and_x86_names() {
+        let p = parse_regs("rax=0x10\neax=0x20\n").unwrap();
+        assert_eq!(p, vec![(RegName::Rax, 0x10), (RegName::Rax, 0x20)]);
+    }
+
+    #[test]
+    fn parse_regs_rejects_unknown_register() {
+        let err = parse_regs("rxx=0\n").unwrap_err();
+        assert!(err.contains("unknown register"), "{err}");
+        assert!(err.contains("rxx"), "{err}");
+    }
+
+    #[test]
+    fn parse_regs_rejects_missing_equals() {
+        let err = parse_regs("rax 5\n").unwrap_err();
+        assert!(err.contains("name=value"), "{err}");
+    }
+
+    #[test]
+    fn parse_regs_rejects_bad_value() {
+        let err = parse_regs("rax=xyz\n").unwrap_err();
+        assert!(err.contains("bad value"), "{err}");
+    }
+
+    #[test]
+    fn parse_regs_skips_blank_lines() {
+        let p = parse_regs("\n\nrip=0x401000\n  \n").unwrap();
+        assert_eq!(p, vec![(RegName::Rip, 0x401000)]);
+    }
+
+    #[test]
+    fn reg_name_write_only_touches_named_slot() {
+        let mut r = Registers { rax: 1, rcx: 2, rip: 3, ..Default::default() };
+        RegName::Rcx.write(&mut r, 0xdead);
+        assert_eq!(r.rax, 1);
+        assert_eq!(r.rcx, 0xdead);
+        assert_eq!(r.rip, 3);
+    }
+
+    #[test]
+    fn reg_name_eflags_truncates_to_u32() {
+        let mut r = Registers::default();
+        RegName::Eflags.write(&mut r, 0xffff_ffff_0000_0001);
+        assert_eq!(r.eflags, 0x0000_0001);
+    }
+
+    #[test]
+    fn parse_resume_mode_defaults_when_missing() {
+        assert!(matches!(parse_resume_mode(""), Ok(ResumeMode::Continue)));
+        assert!(matches!(parse_resume_mode("foo=bar"), Ok(ResumeMode::Continue)));
+    }
+
+    #[test]
+    fn parse_resume_mode_accepts_each_mode() {
+        assert!(matches!(parse_resume_mode("mode=continue"), Ok(ResumeMode::Continue)));
+        assert!(matches!(parse_resume_mode("mode=step"), Ok(ResumeMode::Step)));
+        assert!(matches!(parse_resume_mode("mode=ret"), Ok(ResumeMode::Ret)));
+    }
+
+    #[test]
+    fn parse_resume_mode_rejects_typo() {
+        let err = parse_resume_mode("mode=stp").unwrap_err();
+        assert!(err.contains("stp"), "{err}");
+        assert!(err.contains("continue|step|ret"), "{err}");
+    }
 }
 
 fn binary(status: u16, bytes: Vec<u8>) -> Response<Body> {

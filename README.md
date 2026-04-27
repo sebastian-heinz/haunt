@@ -111,7 +111,10 @@ haunt search "48 89 ?? ?? c3" --module CryGame.dll --limit 16
 progress, no cancel.
 
 **Patch a return value.** Halt at the `ret`, overwrite `rax`,
-resume.
+resume. `setregs` merges into the parked thread's saved CONTEXT —
+registers you don't name keep their captured values. Either x64 (`rax`)
+or x86 (`eax`) names work; unknown names return `400` instead of being
+silently dropped.
 
 ```sh
 haunt bp set 0x7FF601234ABC --kind sw --one-shot
@@ -215,8 +218,8 @@ Only `TerminateProcess` from outside (Task Manager,
 
 The agent refuses to halt its own threads (auto-promotes to no-halt
 with a warning), but cannot detect that some other thread holds a
-lock the agent will need next. WinDbg and x64dbg face the same
-problem and handle it the same way: document the risk.
+lock the agent will need next. Others face the same problem and
+handle it the same way: document the risk.
 
 ## Protocol
 
@@ -269,13 +272,27 @@ Breakpoints:
     requires `size ∈ {1,2,4,8}` (8 is x64-only) and `addr` aligned
     to `size` for `size > 1`. Page rounds `size` up to whole pages.
   - SW and page BPs covering the same page are rejected with `409
-    Conflict` (the SW install momentarily strips `PAGE_GUARD`).
+    Conflict` (the SW install momentarily strips `PAGE_GUARD`). A SW BP
+    on a byte that already contains `0xCC` (compiler-emitted `int 3`,
+    third-party hook, etc.) is rejected with the same status — installing
+    would record `0xCC` as the original byte and infinite-loop on the
+    first hit. A SW BP on a page that already has `PAGE_GUARD` set
+    (target's own stack-growth guard, antivirus sentinel, foreign
+    debugger) is also rejected — the install's `VirtualProtect` would
+    silently strip the guard for the duration of the byte write.
   - Response: `id=N addr=0x...` so name resolution is auditable.
 - `POST /bp/clear?id=N`
 - `GET  /bp/list` and `GET /bp/<id>` — entries include `requested=...` for BPs set by name
 
 Trace events:
 - `GET  /events?since=<id>&limit=N&timeout=<ms>` — long-polls up to 60 s
+
+Agent logs:
+- `GET  /logs?since=<id>&limit=N&timeout=<ms>` — agent's own info/warn/
+  error output (bind status, BP install reports, VEH warnings) over a
+  4096-record ring, long-polls up to 60 s. Replaces `OutputDebugString`
+  (which could block the agent if a debugger was attached but not
+  draining, and mixed output across every process on the box).
 
 Halts:
 - `GET  /halts`

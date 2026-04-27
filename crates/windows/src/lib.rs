@@ -7,20 +7,11 @@ mod process;
 mod regions;
 mod stack;
 
-// MinGW i686 + panic=abort still references _Unwind_Resume from stdlib's
-// alloc. libgcc_eh doesn't resolve it under static linking, so stub it —
-// panic=abort already guarantees any unwind path ends in process abort.
-#[cfg(all(target_arch = "x86", target_env = "gnu"))]
-#[no_mangle]
-pub extern "C" fn _Unwind_Resume() -> ! {
-    std::process::abort()
-}
-
 use std::ffi::c_void;
 use std::sync::Arc;
 use std::thread;
 
-use haunt_core::log::{set_sink, FanOut, StderrSink};
+use haunt_core::log::set_sink;
 use haunt_core::{info, Config, DEFAULT_BIND};
 use windows_sys::Win32::Foundation::{BOOL, HINSTANCE, TRUE};
 use windows_sys::Win32::System::SystemServices::{
@@ -31,7 +22,7 @@ use windows_sys::Win32::System::Threading::GetCurrentProcessId;
 // agent-tid registration, so this DllMain spawn doesn't need to call
 // `mark_agent` itself.
 
-use log::DebugStringSink;
+use log::RingSink;
 use process::SelfProcess;
 
 #[no_mangle]
@@ -46,10 +37,13 @@ pub extern "system" fn DllMain(
             // Do NOT call DisableThreadLibraryCalls — we need DLL_THREAD_ATTACH
             // to propagate hardware breakpoints onto newly created threads.
             thread::spawn(|| {
-                set_sink(Box::new(FanOut::new(vec![
-                    Box::new(StderrSink),
-                    Box::new(DebugStringSink),
-                ])));
+                // Single sink: the agent's own /logs ring buffer. Stderr in
+                // an injected process usually goes nowhere visible (no
+                // console on most GUI targets); OutputDebugStringA can
+                // block the agent if a debugger is attached but not draining
+                // the queue and would mix with every other process's debug
+                // output. Drain via `haunt logs` instead.
+                set_sink(Box::new(RingSink));
                 info!(
                     "v{} attached to pid {}",
                     env!("CARGO_PKG_VERSION"),

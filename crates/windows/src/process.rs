@@ -4,7 +4,7 @@ use std::ffi::CString;
 use haunt_core::thread_role;
 use haunt_core::{
     BpError, BpId, BpSpec, BreakpointInfo, ExportInfo, HaltSummary, MemError, ModuleInfo, Process,
-    RegionInfo, Registers, ResolveError, ResumeMode, StackFrame, ThreadInfo, ThreadStats,
+    RegName, RegionInfo, Registers, ResolveError, ResumeMode, StackFrame, ThreadInfo, ThreadStats,
 };
 use windows_sys::Win32::System::Diagnostics::Debug::{ReadProcessMemory, WriteProcessMemory};
 use windows_sys::Win32::System::LibraryLoader::GetProcAddress;
@@ -89,8 +89,8 @@ impl Process for SelfProcess {
         breakpoint::halt::get_regs(hit_id)
     }
 
-    fn halt_set_regs(&self, hit_id: u64, regs: Registers) -> Result<(), BpError> {
-        breakpoint::halt::set_regs(hit_id, regs)
+    fn halt_set_regs(&self, hit_id: u64, patch: &[(RegName, u64)]) -> Result<(), BpError> {
+        breakpoint::halt::set_regs(hit_id, patch)
     }
 
     fn halt_resume(&self, hit_id: u64, mode: ResumeMode) -> Result<(), BpError> {

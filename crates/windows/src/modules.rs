@@ -1,8 +1,11 @@
 //! Module enumeration and export parsing. All in-process (we're injected).
 
-use std::mem::{size_of, zeroed};
+use std::mem::{size_of, zeroed, MaybeUninit};
 
 use haunt_core::{ExportInfo, ModuleInfo};
+use windows_sys::Win32::System::Memory::{
+    VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_GUARD, PAGE_NOACCESS,
+};
 use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
 // PE32 (x86) and PE32+ (x64) modules use different IMAGE_NT_HEADERS layouts —
 // the OptionalHeader is shorter on x86, putting DataDirectory at a different
@@ -173,10 +176,64 @@ fn in_module(offset: usize, length: usize, module_size: usize) -> bool {
     }
 }
 
+/// Hard cap on the search window for export names + forwarder strings.
+/// A real export name is well under 256 bytes; capping the slice we walk
+/// limits how far we'd dereference into a sparse PE mapping (sections in
+/// a loaded image are page-granular and almost always fully backed, but
+/// a corrupted or unusually-laid-out PE could leave a hole inside `size`,
+/// and walking byte-by-byte to find a NUL would AV inside the agent —
+/// fatal under panic=abort).
+const CSTR_MAX_SCAN: usize = 4096;
+
 unsafe fn read_cstr_bounded(ptr: usize, max: usize) -> Option<String> {
+    // Cap the slice not just by the export-table tail but also by the
+    // committed, readable bytes available from `ptr` onward. Without
+    // this, a malformed PE — or a normal PE with the export string
+    // table abutting an unmapped page — would let `from_raw_parts(ptr,
+    // max)` produce a slice that AVs partway through the NUL scan.
+    // `panic = "abort"` on the cdylib would turn that AV into a host
+    // kill. The CSTR_MAX_SCAN clamp alone is not enough: it limits
+    // length but not whether the bytes at `ptr+i` are mapped.
+    let max = max.min(CSTR_MAX_SCAN);
+    let region_max = match region_tail_readable(ptr) {
+        Some(n) => n,
+        None => return None,
+    };
+    let max = max.min(region_max);
+    if max == 0 {
+        return None;
+    }
     let bytes = std::slice::from_raw_parts(ptr as *const u8, max);
     let nul = bytes.iter().position(|&b| b == 0)?;
     std::str::from_utf8(&bytes[..nul]).ok().map(|s| s.to_string())
+}
+
+/// Bytes from `ptr` to the end of the committed, readable region that
+/// contains it. Returns `None` if uncommitted or unreadable
+/// (`PAGE_NOACCESS` / `PAGE_GUARD`). `VirtualQuery` doesn't take the
+/// loader lock, so this is safe to call from any haunt code path.
+fn region_tail_readable(ptr: usize) -> Option<usize> {
+    let mut info = MaybeUninit::<MEMORY_BASIC_INFORMATION>::uninit();
+    let written = unsafe {
+        VirtualQuery(
+            ptr as *const _,
+            info.as_mut_ptr(),
+            size_of::<MEMORY_BASIC_INFORMATION>(),
+        )
+    };
+    if written == 0 {
+        return None;
+    }
+    let info = unsafe { info.assume_init() };
+    if info.State != MEM_COMMIT {
+        return None;
+    }
+    if info.Protect & (PAGE_NOACCESS | PAGE_GUARD) != 0 {
+        return None;
+    }
+    let region_base = info.BaseAddress as usize;
+    let region_end = region_base.checked_add(info.RegionSize)?;
+    region_end.checked_sub(ptr)
 }
 
 fn wide_to_string(w: &[u16]) -> String {

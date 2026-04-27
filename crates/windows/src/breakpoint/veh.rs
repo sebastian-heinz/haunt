@@ -14,10 +14,13 @@ use windows_sys::Win32::Foundation::{
 use windows_sys::Win32::System::Diagnostics::Debug::{
     ReadProcessMemory, CONTEXT, EXCEPTION_POINTERS,
 };
+use windows_sys::Win32::System::Memory::{
+    VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_EXECUTE,
+    PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY, PAGE_GUARD,
+};
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetCurrentThreadId};
 
 use super::{arch, halt, hardware, page, software, KindState};
-use crate::modules;
 
 const TRAP_FLAG: u32 = 0x100;
 const RESUME_FLAG: u32 = 0x1_0000;
@@ -46,9 +49,20 @@ enum StepMode {
 // and a page rearm. Previously a single `Cell<Option<Rearm>>` would
 // silently lose the earlier rearm when on_int3 overwrote a page rearm
 // from on_guard_page (or vice versa).
+//
+// `PENDING_PAGE` is a Vec because a single instruction can fault on
+// multiple guarded pages before the next TF fires: a misaligned load
+// crossing a page boundary (or `rep movs` etc.) traps once per page,
+// and each `on_guard_page` invocation must record a rearm. A scalar
+// Option would lose every page after the first — silently making the
+// BP one-shot for the lost pages on the very first multi-page hit.
+//
+// Cell (not RefCell) on purpose: RefCell::borrow_mut panics if the
+// cell is already borrowed, and `panic = "abort"` on the cdylib means
+// any panic kills the host. The take/set pattern below is panic-free.
 thread_local! {
     static PENDING_SW: Cell<Option<SoftwareRearm>> = const { Cell::new(None) };
-    static PENDING_PAGE: Cell<Option<PageRearm>> = const { Cell::new(None) };
+    static PENDING_PAGE: Cell<Vec<PageRearm>> = const { Cell::new(Vec::new()) };
     static STEP: Cell<StepMode> = const { Cell::new(StepMode::None) };
 }
 
@@ -59,7 +73,19 @@ pub(super) unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i
     match record.ExceptionCode {
         EXCEPTION_BREAKPOINT => on_int3(record.ExceptionAddress as usize, context),
         EXCEPTION_SINGLE_STEP => on_single_step(context),
-        EXCEPTION_GUARD_PAGE => on_guard_page(record.ExceptionAddress as usize, context),
+        EXCEPTION_GUARD_PAGE => {
+            // ExceptionAddress is the *instruction pointer* at fault time —
+            // useless for read/write page BPs because the IP is on a code
+            // page, not the guarded data page. The actual address that
+            // tripped PAGE_GUARD lives in ExceptionInformation[1]; [0] is
+            // the access type (0=read, 1=write, 8=DEP). Without this, page
+            // BPs on data pages fall through to EXCEPTION_CONTINUE_SEARCH
+            // and the OS terminates the host.
+            if record.NumberParameters < 2 {
+                return EXCEPTION_CONTINUE_SEARCH;
+            }
+            on_guard_page(record.ExceptionInformation[1], context)
+        }
         _ => EXCEPTION_CONTINUE_SEARCH,
     }
 }
@@ -78,7 +104,30 @@ unsafe fn on_int3(addr: usize, context: &mut CONTEXT) -> i32 {
             e.addr == addr && matches!(e.state, KindState::Software(_))
         }) {
             Some(e) => e,
-            None => return EXCEPTION_CONTINUE_SEARCH,
+            None => {
+                // Race recovery: `clear()` may have removed this BP and
+                // restored the byte after the int3 fired but before our
+                // lookup acquired the registry lock. The CPU's saved IP
+                // points past the int3 byte (int3 is a trap, not a
+                // fault), so resuming as-is would either skip the
+                // single-byte instruction at `addr` or land mid-
+                // instruction on a multi-byte original — silent
+                // corruption. Detect by inspecting the byte: if it's no
+                // longer 0xCC, clear() restored it; rewinding IP to
+                // `addr` re-executes the original instruction and
+                // closes the race. If the byte is still 0xCC, the int3
+                // belongs to someone else (compiler-emitted, third-
+                // party tool); propagate so their handler / OS can
+                // deal with it. Reading via `ReadProcessMemory` rather
+                // than direct deref so a concurrent unmap can't AV us
+                // inside the VEH.
+                drop(reg);
+                if matches!(read_byte(addr), Some(b) if b != software::INT3) {
+                    arch::set_ip(context, addr as u64);
+                    return EXCEPTION_CONTINUE_EXECUTION;
+                }
+                return EXCEPTION_CONTINUE_SEARCH;
+            }
         };
         let KindState::Software(sw) = &mut entry.state else {
             return EXCEPTION_CONTINUE_SEARCH;
@@ -108,13 +157,33 @@ unsafe fn on_int3(addr: usize, context: &mut CONTEXT) -> i32 {
 }
 
 unsafe fn on_single_step(context: &mut CONTEXT) -> i32 {
+    // Invariant: on_single_step exits with TRAP_FLAG cleared. The flag's
+    // sole legitimate post-handler use is "the user asked for another
+    // step", which `apply_resume_mode(Step)` re-sets explicitly. Clearing
+    // here unconditionally closes a host-kill path: if TF were left set
+    // after a step→continue (HW BP halt path, or any step sequence with
+    // no pending rearm to clear it), the next TF trap would land here
+    // with no rearm, no STEP, and no DR slot fired, fall through to
+    // EXCEPTION_CONTINUE_SEARCH, and the OS would terminate the host.
+    context.EFlags &= !TRAP_FLAG;
+
     // 1. Process all pending re-arms accumulated since the last single-
     // step. Page and SW rearms can both be live simultaneously when a
     // page BP and a SW BP fire on the same instruction (e.g. a write
     // to a code page that also has an int3). Lose neither.
     let sw_rearm = PENDING_SW.with(|p| p.take());
-    let page_rearm = PENDING_PAGE.with(|p| p.take());
-    let had_rearm = sw_rearm.is_some() || page_rearm.is_some();
+    // `try_with` rather than `with` because `Vec<PageRearm>` has a
+    // destructor that the thread-local runtime runs at thread exit.
+    // After that destructor has run, `with` would panic — and a panic
+    // under `panic = "abort"` on the cdylib kills the host. Our VEH
+    // can theoretically fire on a thread mid-teardown (e.g., a SW BP
+    // on a function called from `DLL_THREAD_DETACH` of another DLL);
+    // silently treating PENDING_PAGE as empty in that window is the
+    // correct degradation.
+    let page_rearms: Vec<PageRearm> = PENDING_PAGE
+        .try_with(|p| p.take())
+        .unwrap_or_default();
+    let had_rearm = sw_rearm.is_some() || !page_rearms.is_empty();
 
     if let Some(rearm) = sw_rearm {
         if let Some(id) = rearm.one_shot_id {
@@ -136,18 +205,18 @@ unsafe fn on_single_step(context: &mut CONTEXT) -> i32 {
             }
         }
     }
-    if let Some(rearm) = page_rearm {
+    for rearm in page_rearms {
         page::rearm(rearm.base, rearm.original_protect);
-    }
-    if had_rearm {
-        context.EFlags &= !TRAP_FLAG;
     }
 
     // 2. If the user had requested a step, the single-step we just handled (either
     //    a re-arm step or a bare step) is the user's step. Halt now.
     if STEP.with(|s| s.replace(StepMode::None)) == StepMode::Step {
-        let mode = halt::halt_and_wait(None, context);
-        apply_resume_mode(mode, context);
+        if let Some(mode) = halt::halt_and_wait(None, context) {
+            apply_resume_mode(mode, context);
+        } else {
+            warn!("step halt could not park (event/lock/shutdown); thread continues");
+        }
         return EXCEPTION_CONTINUE_EXECUTION;
     }
 
@@ -198,29 +267,60 @@ unsafe fn on_single_step(context: &mut CONTEXT) -> i32 {
 }
 
 unsafe fn on_guard_page(addr: usize, context: &mut CONTEXT) -> i32 {
-    let Some((base, original_protect)) = page::find_containing(addr) else {
-        return EXCEPTION_CONTINUE_SEARCH;
-    };
-
-    let (bp_id, options, hooks, tid_matches) = {
+    // Single lock acquisition: previously this did `find_containing`
+    // (which took the registry lock, returned, and dropped it) and then
+    // re-acquired the lock to mutate the entry. A concurrent `clear()`
+    // in that window left us with no entry → EXCEPTION_CONTINUE_SEARCH
+    // → host kill (the kernel auto-cleared PAGE_GUARD before invoking
+    // the VEH, so nothing else handles the exception).
+    let page = page::page_base(addr);
+    let (bp_id, options, hooks, tid_matches, base, original_protect) = {
         let mut reg = match super::registry().lock() {
             Ok(g) => g,
             Err(_) => return EXCEPTION_CONTINUE_SEARCH,
         };
         let tid = GetCurrentThreadId();
-        let Some(entry) = reg.values_mut().find(|e| match &e.state {
-            KindState::Page(s) => s.pages.iter().any(|&(b, _)| b == base),
+        let mut matched: Option<(usize, u32)> = None;
+        let entry = reg.values_mut().find(|e| match &e.state {
+            KindState::Page(s) => match s.pages.iter().find(|&&(b, _)| b == page) {
+                Some(&(b, orig)) => {
+                    matched = Some((b, orig));
+                    true
+                }
+                None => false,
+            },
             _ => false,
-        }) else {
-            return EXCEPTION_CONTINUE_SEARCH;
+        });
+        let entry = match entry {
+            Some(e) => e,
+            None => {
+                // No registered BP covers this page. Before propagating,
+                // check whether this is a known orphan from a failed
+                // install (a page we set PAGE_GUARD on and couldn't
+                // restore via VirtualProtect during rollback). If so,
+                // the kernel already cleared PAGE_GUARD on this fault
+                // — removing the entry is enough; the access will
+                // succeed on retry. Without this recovery, the orphan
+                // would propagate to EXCEPTION_CONTINUE_SEARCH and the
+                // OS unhandled-exception filter would kill the host.
+                drop(reg);
+                if page::take_orphan(addr) {
+                    return EXCEPTION_CONTINUE_EXECUTION;
+                }
+                return EXCEPTION_CONTINUE_SEARCH;
+            }
+        };
+        let (b, orig) = match matched {
+            Some(m) => m,
+            None => return EXCEPTION_CONTINUE_SEARCH,
         };
         entry.hits += 1;
         let tid_match = entry.options.tid_filter.map(|t| t == tid).unwrap_or(true);
-        (entry.id, entry.options, Arc::clone(&entry.hooks), tid_match)
+        (entry.id, entry.options, Arc::clone(&entry.hooks), tid_match, b, orig)
     };
 
     context.EFlags |= TRAP_FLAG;
-    PENDING_PAGE.with(|p| p.set(Some(PageRearm { base, original_protect })));
+    push_page_rearm(PageRearm { base, original_protect });
 
     if tid_matches {
         let _ = run_hooks_then_maybe_halt(bp_id, options, &hooks, context);
@@ -229,6 +329,55 @@ unsafe fn on_guard_page(addr: usize, context: &mut CONTEXT) -> i32 {
     EXCEPTION_CONTINUE_EXECUTION
 }
 
+/// Append a page rearm to this thread's pending-rearm list.
+///
+/// Implemented via `Cell::take` + push + `Cell::set` rather than
+/// `RefCell::borrow_mut` to stay panic-free under `panic = "abort"`. If
+/// the page-rearm path ever recurses on the same thread (e.g. a page BP
+/// covering memory that `Vec::push` allocates into), the inner call's
+/// `take` would observe the empty default and the outer call's `set`
+/// would later overwrite the inner's recorded entry — losing it. That
+/// is preferable to a `RefCell::already_borrowed` panic, which would
+/// kill the host. The "user PAGE_GUARDed their own heap" case is a
+/// clear footgun and acceptable to degrade.
+///
+/// Uses `try_with` for the same reason as the drain side: `Vec` has a
+/// destructor, so accessing PENDING_PAGE during/after thread-local
+/// teardown would panic. Silently dropping a rearm there is fine — the
+/// page BP becomes one-shot for this teardown-bound thread.
+fn push_page_rearm(rearm: PageRearm) {
+    let _ = PENDING_PAGE.try_with(|p| {
+        let mut v = p.take();
+        // Guard against a runaway producer (e.g. a buggy instruction
+        // looping in fault — should be impossible but cheap to bound).
+        // 64 entries is far more than any real instruction touches and
+        // far less than would matter for memory pressure.
+        const PENDING_PAGE_CAP: usize = 64;
+        if v.len() < PENDING_PAGE_CAP {
+            v.push(rearm);
+        }
+        p.set(v);
+    });
+}
+
+/// Translate a user-selected resume mode into the post-halt CONTEXT and
+/// per-thread step state.
+///
+/// Deliberately does NOT touch `TRAP_FLAG` for `Continue` / `Ret`. The
+/// flag's lifecycle is owned end-to-end by the trap handlers:
+/// - `on_int3` and `on_guard_page` set TF before they return so the next
+///   instruction single-steps and `on_single_step` can re-arm.
+/// - `on_single_step` clears TF at entry, so any path through it (rearm,
+///   user step, HW BP, fall-through) leaves TF correct on resume.
+/// - Only `apply_resume_mode(Step)` re-sets TF here, after the handler
+///   has cleared it.
+///
+/// Clearing TF here would defeat `on_int3`'s rearm step: a SW BP halt
+/// followed by `Continue` would resume with TF=0, the original
+/// instruction would execute without a TF trap, and the rearm in
+/// `on_single_step` would never fire — turning every halt-then-continue
+/// into a one-shot BP and leaking a stale `PENDING_SW` until some
+/// unrelated TF later "consumed" it on the wrong instruction.
 fn apply_resume_mode(mode: ResumeMode, context: &mut CONTEXT) {
     match mode {
         ResumeMode::Continue => {
@@ -290,9 +439,24 @@ unsafe fn run_hooks_then_maybe_halt(
             );
             return false;
         }
-        let mode = halt::halt_and_wait(Some(bp_id), context);
-        apply_resume_mode(mode, context);
-        true
+        match halt::halt_and_wait(Some(bp_id), context) {
+            Some(mode) => {
+                apply_resume_mode(mode, context);
+                true
+            }
+            None => {
+                // Park failed (event creation, lock, or shutdown). The
+                // thread will continue without halting; return false so
+                // the HW-BP dispatch loop keeps running other BPs that
+                // fired on the same instruction instead of breaking
+                // early on a halt that didn't actually happen.
+                warn!(
+                    "bp {} halt could not park; thread continues",
+                    bp_id.0,
+                );
+                false
+            }
+        }
     } else {
         false
     }
@@ -361,12 +525,29 @@ impl dsl::Eval for HitEvalCtx {
     }
 }
 
+/// Read a single byte at `addr` without faulting. Returns `None` if the
+/// page is unmapped, which here means "give up gracefully" rather than
+/// AV inside the VEH.
+unsafe fn read_byte(addr: usize) -> Option<u8> {
+    let mut buf = [0u8; 1];
+    let mut read: usize = 0;
+    let ok = ReadProcessMemory(
+        GetCurrentProcess(),
+        addr as *const _,
+        buf.as_mut_ptr() as *mut _,
+        1,
+        &mut read,
+    ) != 0
+        && read == 1;
+    if ok { Some(buf[0]) } else { None }
+}
+
 fn install_run_to_ret(context: &mut CONTEXT) {
     // Read [xSP] — assumed to be the return address. This holds at function
     // entry or right before `ret`; mid-function, [xSP] is whatever local was
-    // pushed last. We sanity-check that the read points into an executable
-    // module rather than spawning a one-shot SW BP at a junk address (which
-    // would 0xCC random memory).
+    // pushed last. We sanity-check that the address points into committed,
+    // executable memory rather than spawning a one-shot SW BP at a junk
+    // address (which would 0xCC random memory).
     const PTR_BYTES: usize = std::mem::size_of::<usize>();
     let sp = arch::sp(context) as usize;
     let mut buf = [0u8; PTR_BYTES];
@@ -386,9 +567,9 @@ fn install_run_to_ret(context: &mut CONTEXT) {
         return;
     }
     let ret_addr = usize::from_le_bytes(buf);
-    if !addr_in_any_module(ret_addr) {
+    if !addr_is_executable(ret_addr) {
         warn!(
-            "ret mode: [xSP]=0x{ret_addr:x} not in any loaded module — \
+            "ret mode: [xSP]=0x{ret_addr:x} is not committed-executable — \
              refusing to plant SW BP at junk address. Likely caused by \
              halting mid-function (only safe at function entry / right \
              before ret)."
@@ -405,8 +586,48 @@ fn install_run_to_ret(context: &mut CONTEXT) {
     });
 }
 
-fn addr_in_any_module(addr: usize) -> bool {
-    modules::list()
-        .iter()
-        .any(|m| addr >= m.base && addr < m.base.saturating_add(m.size))
+/// True if `addr` is in a committed, executable memory region. Used to
+/// gate run-to-ret against junk return addresses.
+///
+/// This deliberately uses `VirtualQuery` rather than walking the loaded-
+/// module list:
+/// - `VirtualQuery` does not take the PEB loader lock. The previous
+///   `modules::list()`-based check called `CreateToolhelp32Snapshot`,
+///   which does — and it ran from the VEH path on the resuming thread,
+///   creating a deadlock vector if any other thread was in our VEH
+///   blocked on the registry lock while holding the loader lock (e.g.,
+///   faulted inside `LdrpLoadDll`).
+/// - It accepts JIT regions (V8, .NET CLR, JVM, runtime-patched code)
+///   in addition to image-mapped modules. The previous check rejected
+///   those — a footgun for anyone instrumenting JIT'd targets.
+/// - It rejects the actually-bad cases: uncommitted memory, stack/data
+///   pages without execute permission, `PAGE_NOACCESS`, `PAGE_GUARD`.
+fn addr_is_executable(addr: usize) -> bool {
+    use std::mem::{size_of, MaybeUninit};
+    let mut info = MaybeUninit::<MEMORY_BASIC_INFORMATION>::uninit();
+    let written = unsafe {
+        VirtualQuery(
+            addr as *const _,
+            info.as_mut_ptr(),
+            size_of::<MEMORY_BASIC_INFORMATION>(),
+        )
+    };
+    if written == 0 {
+        return false;
+    }
+    let info = unsafe { info.assume_init() };
+    if info.State != MEM_COMMIT {
+        return false;
+    }
+    // PAGE_GUARD is a flag ORed onto the base protection. A guarded page
+    // is meant to fault on access; planting a SW BP on it would interfere
+    // with whatever set up the guard (haunt's own page BPs, a third-party
+    // tool, or stack-growth guards) and corrupt the byte for one hit
+    // before being silently auto-cleared by the kernel.
+    if info.Protect & PAGE_GUARD != 0 {
+        return false;
+    }
+    const EXEC_MASK: u32 =
+        PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+    info.Protect & EXEC_MASK != 0
 }

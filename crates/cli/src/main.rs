@@ -49,7 +49,10 @@ Connect / introspect:
 
 Memory:
   read <addr> [len]          hex output; default len=16. Partial reads
-                             return only the readable prefix (status 206).
+                             (range crosses an unmapped page) return
+                             only the readable prefix; CLI prints a
+                             stderr warning naming actual/requested
+                             bytes.
   read-raw <addr> <len>      same but binary to stdout
   write <addr> <hex>         write hex-encoded bytes (whitespace ignored)
   search <pattern> [--module <name>] [--start <addr>] [--end <addr>]
@@ -84,7 +87,11 @@ Breakpoints:
                              page: --size is bytes, rounded up to pages.
                                    PAGE_GUARD fires on any access kind.
                              SW + page BPs covering the same page are
-                             rejected with 409 Conflict.
+                             rejected with 409 Conflict. SW BPs on a
+                             byte that's already 0xCC, or on a page that
+                             already has PAGE_GUARD set (stack-growth
+                             guard, AV sentinel, foreign debugger), are
+                             likewise rejected.
 
   bp list                    all BPs, one per line; includes hit count
                              and `requested=\"...\"` for name-resolved BPs
@@ -124,8 +131,12 @@ Halts (parked threads):
                              Convs:
                                x64: win64, sysv (sysv64)
                                x86: thiscall, fastcall, stdcall, cdecl
-  setregs <hit_id>           apply `name=value` lines from stdin to a
-                             parked thread; takes effect on resume.
+  setregs <hit_id>           merge `name=value` lines from stdin into
+                             the parked thread's saved registers; takes
+                             effect on resume. Registers you don't name
+                             keep their captured values. Both x64 (`rax`)
+                             and x86 (`eax`) names work; unknown names
+                             return 400.
                              Example:
                                printf 'rax=0\\n' | haunt setregs 7
                              TTY input prints a hint; pipe for scripts.
@@ -136,8 +147,10 @@ Halts (parked threads):
                                --ret       run to return: plants a
                                            one-shot SW BP at [xSP] and
                                            continues; refused if [xSP]
-                                           is not inside a loaded
-                                           module (junk-address guard)
+                                           is not committed-executable
+                                           memory (junk-address guard;
+                                           accepts both modules and JIT
+                                           regions)
 
 Trace events (from `--log` BPs):
   events [--since <id>] [--limit N] [--timeout <ms>]
@@ -147,6 +160,16 @@ Trace events (from `--log` BPs):
                              Each record: id, bp_id, tid, rip, t (ms
                              since first event), msg (the rendered
                              template).
+
+Agent logs:
+  logs [--since <id>] [--limit N] [--timeout <ms>]
+                             tail the agent's own info/warn/error
+                             output (the messages haunt.dll itself
+                             emits — bind status, BP install reports,
+                             VEH-path warnings). 4096-record ring,
+                             same long-poll semantics as `events`.
+                             Each record: id, t (ms since first log),
+                             level, tid, msg.
 
 See README for full workflows (range watchpoint, dtrace-style tracing,
 return-value patching) and the \"Halts and global locks\" warning
@@ -199,6 +222,7 @@ fn dispatch(args: &[String]) -> Result<(), String> {
         "regions" => get("/memory/regions").map(print_ok),
         "threads" => get("/threads").map(print_ok),
         "events" => cmd_events(rest),
+        "logs" => cmd_logs(rest),
         "resolve" => {
             let name = rest.first().ok_or("resolve <module!symbol>")?;
             get(&format!("/symbols/resolve?name={}", url_encode(name))).map(print_ok)
@@ -231,24 +255,57 @@ fn cmd_read(args: &[String], raw: bool) -> Result<(), String> {
         (None, false) => "16",
         (None, true) => return Err("read-raw <addr> <len>".into()),
     };
+    let addr_enc = url_encode(addr);
+    let len_enc = url_encode(len);
     let path = if raw {
-        format!("/memory/read?addr={addr}&len={len}&format=raw")
+        format!("/memory/read?addr={addr_enc}&len={len_enc}&format=raw")
     } else {
-        format!("/memory/read?addr={addr}&len={len}")
+        format!("/memory/read?addr={addr_enc}&len={len_enc}")
     };
-    let body = get(&path)?;
+    // Use `request_full` so we can detect a 206 (partial content) — the
+    // agent returns the readable prefix when the read crosses an unmapped
+    // page. Without this, a `haunt read 0x1000 4096` that gets back 800
+    // readable bytes prints 1600 hex chars with no signal that truncation
+    // happened; the user has to count and compare against `len`.
+    let (status, body) = request_full("GET", &path, None)?;
     std::io::stdout().write_all(&body).ok();
     if !raw && body.last().copied() != Some(b'\n') {
         println!();
     }
+    if status == 206 {
+        // Body is hex-encoded in default mode (2 chars per byte) and raw
+        // bytes in `--raw` mode. The agent's `hex_encode` does not emit a
+        // trailing newline, so the divide-by-two is exact.
+        let actual_bytes = if raw { body.len() } else { body.len() / 2 };
+        match parse_usize(len) {
+            Some(r) => eprintln!(
+                "haunt: read truncated at unmapped boundary: {actual_bytes}/{r} bytes returned",
+            ),
+            None => eprintln!(
+                "haunt: read truncated at unmapped boundary: {actual_bytes} bytes returned",
+            ),
+        }
+    }
     Ok(())
+}
+
+/// Parse `0x...` hex or decimal usize. Mirrors the agent's parser. Used
+/// only to recover the user-supplied requested length for the 206
+/// truncation message — failure to parse just drops the requested-vs-
+/// actual comparison from the message.
+fn parse_usize(s: &str) -> Option<usize> {
+    if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        usize::from_str_radix(hex, 16).ok()
+    } else {
+        s.parse().ok()
+    }
 }
 
 fn cmd_write(args: &[String]) -> Result<(), String> {
     let addr = args.first().ok_or("write <addr> <hex>")?;
     let hex = args.get(1).ok_or("write <addr> <hex>")?;
     let bytes = hex_decode(hex).ok_or("invalid hex")?;
-    let body = post(&format!("/memory/write?addr={addr}"), &bytes)?;
+    let body = post(&format!("/memory/write?addr={}", url_encode(addr)), &bytes)?;
     print_ok(body);
     Ok(())
 }
@@ -268,10 +325,14 @@ fn cmd_bp(args: &[String]) -> Result<(), String> {
         }
         "set" => {
             let target = rest.first().ok_or("bp set <addr|module!symbol> [opts]")?;
+            // Encode the addr too. Real addresses are pure hex digits and
+            // need no encoding, but a typo containing `&`, `+`, `%`, or `#`
+            // would otherwise corrupt the query and the agent would parse a
+            // mangled value rather than rejecting it cleanly.
             let mut query = if target.contains('!') {
                 format!("name={}", url_encode(target))
             } else {
-                format!("addr={target}")
+                format!("addr={}", url_encode(target))
             };
             let mut i = 1;
             while i < rest.len() {
@@ -440,7 +501,11 @@ fn cmd_args(args: &[String]) -> Result<(), String> {
     let regs = parse_regs_lines(&body)?;
     let (reg_args, stack_offset, ptr_size) = layout_for_conv(&conv, &regs)?;
 
-    // Bulk-fetch stack slots in one round trip rather than N.
+    // Bulk-fetch stack slots in one round trip rather than N. The agent
+    // returns a 206 (partial content) when the requested range crosses an
+    // unmapped page; the CLI's `request()` accepts any 2xx and surfaces the
+    // shorter body, so `stack_bytes` may be smaller than `len`. Print the
+    // args we got, then surface the truncation rather than panic-slicing.
     let stack_count = count.saturating_sub(reg_args.len());
     let stack_bytes = if stack_count > 0 {
         let sp = regs
@@ -459,15 +524,27 @@ fn cmd_args(args: &[String]) -> Result<(), String> {
     for (i, &v) in reg_args.iter().take(count).enumerate() {
         println!("arg{}: 0x{v:x}", i + 1);
     }
-    for i in 0..stack_count {
+    let readable_stack_args = stack_bytes.len() / ptr_size;
+    for i in 0..readable_stack_args.min(stack_count) {
         let off = i * ptr_size;
-        let bytes = &stack_bytes[off..off + ptr_size];
+        let chunk = &stack_bytes[off..off + ptr_size];
         let v = match ptr_size {
-            8 => u64::from_le_bytes(bytes.try_into().unwrap()),
-            4 => u32::from_le_bytes(bytes.try_into().unwrap()) as u64,
-            _ => 0,
+            8 => {
+                let arr: [u8; 8] = chunk.try_into().expect("ptr_size==8 guarantees 8 bytes");
+                u64::from_le_bytes(arr)
+            }
+            4 => {
+                let arr: [u8; 4] = chunk.try_into().expect("ptr_size==4 guarantees 4 bytes");
+                u32::from_le_bytes(arr) as u64
+            }
+            _ => return Err(format!("unexpected ptr_size: {ptr_size}")),
         };
         println!("arg{}: 0x{v:x}", reg_args.len() + i + 1);
+    }
+    if readable_stack_args < stack_count {
+        eprintln!(
+            "haunt: stack read truncated; got {readable_stack_args}/{stack_count} stack args (probably crossed an unmapped page near rsp)"
+        );
     }
     Ok(())
 }
@@ -582,14 +659,54 @@ fn cmd_events(args: &[String]) -> Result<(), String> {
     get(&format!("/events?since={since}&limit={limit}&timeout={timeout}")).map(print_ok)
 }
 
+fn cmd_logs(args: &[String]) -> Result<(), String> {
+    let mut since: u64 = 0;
+    let mut limit: u64 = 256;
+    let mut timeout: u64 = 0;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--since" => {
+                since = args.get(i + 1).ok_or("--since value")?.parse().map_err(|_| "bad since")?;
+                i += 2;
+            }
+            "--limit" => {
+                limit = args.get(i + 1).ok_or("--limit value")?.parse().map_err(|_| "bad limit")?;
+                i += 2;
+            }
+            "--timeout" => {
+                timeout = args.get(i + 1).ok_or("--timeout value")?.parse().map_err(|_| "bad timeout")?;
+                i += 2;
+            }
+            other => return Err(format!("unknown flag: {other}")),
+        }
+    }
+    get(&format!("/logs?since={since}&limit={limit}&timeout={timeout}")).map(print_ok)
+}
+
 fn cmd_resume(args: &[String]) -> Result<(), String> {
-    let id = args.first().ok_or("resume <hit_id> [--step|--ret]")?;
-    let mode = args.iter().skip(1).find_map(|a| match a.as_str() {
-        "--step" => Some("step"),
-        "--ret" => Some("ret"),
-        "--continue" => Some("continue"),
-        _ => None,
-    }).unwrap_or("continue");
+    let id = args.first().ok_or("resume <hit_id> [--continue|--step|--ret]")?;
+    // Walk the rest strictly: reject unknown flags and reject conflicting
+    // mode flags. The previous `find_map(...).unwrap_or("continue")` would
+    // silently drop typos like `--stp` and silently pick the first of
+    // multiple mode flags — both bugs the new strict-validation policy
+    // forbids.
+    let mut mode: Option<&'static str> = None;
+    for a in args.iter().skip(1) {
+        let next = match a.as_str() {
+            "--continue" => "continue",
+            "--step" => "step",
+            "--ret" => "ret",
+            other => return Err(format!("unknown flag: {other}")),
+        };
+        if let Some(prev) = mode {
+            if prev != next {
+                return Err(format!("conflicting resume modes: --{prev} and --{next}"));
+            }
+        }
+        mode = Some(next);
+    }
+    let mode = mode.unwrap_or("continue");
     post(&format!("/halts/{id}/resume?mode={mode}"), &[]).map(print_ok)
 }
 
@@ -604,14 +721,18 @@ fn token() -> Option<String> {
 }
 
 fn get(path: &str) -> Result<Vec<u8>, String> {
-    request("GET", path, None)
+    request_full("GET", path, None).map(|(_, b)| b)
 }
 
 fn post(path: &str, body: &[u8]) -> Result<Vec<u8>, String> {
-    request("POST", path, Some(body))
+    request_full("POST", path, Some(body)).map(|(_, b)| b)
 }
 
-fn request(method: &str, path: &str, body: Option<&[u8]>) -> Result<Vec<u8>, String> {
+/// Like `get`/`post` but exposes the HTTP status alongside the body, for
+/// callers that need to distinguish 200 (full read) from 206 (partial
+/// content — body is the readable prefix, shorter than what was asked
+/// for). Most callers don't care; they should keep using `get`/`post`.
+fn request_full(method: &str, path: &str, body: Option<&[u8]>) -> Result<(u16, Vec<u8>), String> {
     let base = base_url();
     let rest = base.strip_prefix("http://").ok_or("HAUNT_URL must be http://...")?;
     let host_port = match rest.find('/') {
@@ -670,7 +791,7 @@ fn request(method: &str, path: &str, body: Option<&[u8]>) -> Result<Vec<u8>, Str
         let s = String::from_utf8_lossy(&body_bytes);
         return Err(format!("HTTP {status}: {}", s.trim()));
     }
-    Ok(body_bytes)
+    Ok((status, body_bytes))
 }
 
 fn url_encode(s: &str) -> String {

@@ -1,25 +1,24 @@
-//! Windows-specific log sinks.
+//! Windows log sink: drops records onto the agent's `/logs` ring buffer.
 //!
-//! `OutputDebugStringA` writes to the debugger's output channel. Under a
-//! real debugger (WinDbg, Visual Studio) it appears in the output pane;
-//! DebugView attaches without a debugger. Under WINE, set
-//! `WINEDEBUG=+debugstr` on the host to route these to stderr.
-
-use std::ffi::CString;
+//! Replaces the old `OutputDebugStringA` sink. That channel could BLOCK the
+//! emitter when a debugger was attached but not draining the LPC queue,
+//! mixed output across every process on the box, and required DebugView /
+//! a real debugger to observe. The ring buffer is bounded, never blocks,
+//! per-process, and reaches the user through the same HTTP transport
+//! (`haunt logs` / `GET /logs`) as everything else.
 
 use haunt_core::log::{Level, Sink};
-use windows_sys::Win32::System::Diagnostics::Debug::OutputDebugStringA;
+use haunt_core::logs;
+use windows_sys::Win32::System::Threading::GetCurrentThreadId;
 
-pub struct DebugStringSink;
+pub struct RingSink;
 
-impl Sink for DebugStringSink {
+impl Sink for RingSink {
     fn log(&self, level: Level, msg: &str) {
-        // CString rejects interior NULs; strip them rather than dropping
-        // the whole record.
-        let sanitized: String = msg.chars().filter(|c| *c != '\0').collect();
-        let line = format!("{} haunt: {}\n", level.as_str(), sanitized);
-        if let Ok(c) = CString::new(line) {
-            unsafe { OutputDebugStringA(c.as_ptr() as *const u8) };
-        }
+        // Capture the OS tid here rather than threading it through the
+        // platform-agnostic `Sink` trait. core stays Win32-free; only this
+        // file knows about `GetCurrentThreadId`.
+        let tid = unsafe { GetCurrentThreadId() };
+        logs::push(level, tid, msg.to_string());
     }
 }

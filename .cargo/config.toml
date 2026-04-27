@@ -20,7 +20,7 @@ rustflags = [
     # Some i686 MinGW builds (notably Debian/Ubuntu's gcc-mingw-w64-i686
     # with the win32 threading model) define `_Unwind_Resume` in
     # libgcc_eh.a; brew's posix-threading build does not. Our manual
-    # stub in inject/main.rs and windows/lib.rs collides on the former.
+    # stub in haunt-core (lib.rs) collides on the former.
     # `--allow-multiple-definition` lets either side win at link time —
     # both implementations abort the process, so behaviour is identical.
     "-C", "link-arg=-Wl,--allow-multiple-definition",

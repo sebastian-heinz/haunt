@@ -13,3 +13,15 @@
 - Keep the `haunt` CLI help text (`USAGE` in `crates/cli/src/main.rs`)
   in sync with command/flag changes.
 - Keep all documentation brief and factual. No wordiness, no fluff.
+- Always apply the best possible fix regardless of whether the syntax,
+  protocol, or behavior is backwards compatible. No deprecation shims,
+  no compat aliases, no "preserve old form for callers." Update the
+  README, USAGE, and any CHANGELOG entry to match.
+- Prefer strict validation and clear rejection over silent acceptance.
+  Bad inputs to API calls — unparseable numbers, unknown enum values,
+  unsupported flag combinations (e.g. `--access` with `kind=sw`) — must
+  return a `400` (HTTP) or non-zero exit (CLI) with a message that
+  names the offending parameter. No silent defaults, no `unwrap_or`
+  fallbacks on user-supplied values, no quietly-ignored flags. The
+  user must learn from the error what to change; guessing what they
+  meant produces target-process bugs that surface hours later.

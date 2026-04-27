@@ -3,7 +3,11 @@
 //! Install ordering keeps the registry consistent with on-CPU / in-memory state when
 //! the VEH handler runs:
 //! - Software / page: registry lock held across the memory write.
-//! - Hardware: registry entry inserted before any thread's DR registers are set.
+//! - Hardware: registry lock held across the DR-mutation sweep that visits
+//!   every existing thread; the entry is inserted only after the kernel
+//!   call succeeds. A failed install therefore leaves the registry
+//!   unchanged, and a concurrent `clear()` of a different HW BP cannot
+//!   re-allocate the same slot mid-sweep.
 
 pub mod halt;
 
@@ -71,21 +75,38 @@ pub(crate) enum KindState {
 }
 
 static REGISTRY: OnceLock<Mutex<HashMap<BpId, Entry>>> = OnceLock::new();
-static VEH_INSTALLED: OnceLock<()> = OnceLock::new();
+/// `true` once `AddVectoredExceptionHandler` has succeeded; `false` if it
+/// returned NULL on the first call. Stored in the OnceLock so subsequent
+/// callers see the install outcome rather than re-running the closure
+/// (`get_or_init` only runs its closure once — without storing the
+/// result, a failed first install would silently succeed for every later
+/// caller while no VEH was actually registered).
+static VEH_INSTALLED: OnceLock<bool> = OnceLock::new();
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 pub(crate) fn registry() -> &'static Mutex<HashMap<BpId, Entry>> {
     REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn ensure_veh() {
-    VEH_INSTALLED.get_or_init(|| {
-        unsafe { AddVectoredExceptionHandler(1, Some(veh::handler)) };
+fn ensure_veh() -> Result<(), BpError> {
+    // `AddVectoredExceptionHandler` returns NULL on failure (extremely
+    // rare — would imply ntdll handler-list allocation failure). Without
+    // a registered VEH every BP is a no-op: int3 / single-step /
+    // PAGE_GUARD all propagate to the OS default handler and crash the
+    // host. Refuse to install the BP rather than ship a footgun.
+    let installed = VEH_INSTALLED.get_or_init(|| {
+        let h = unsafe { AddVectoredExceptionHandler(1, Some(veh::handler)) };
+        !h.is_null()
     });
+    if *installed {
+        Ok(())
+    } else {
+        Err(BpError::Internal)
+    }
 }
 
 pub fn set(spec: BpSpec) -> Result<BpId, BpError> {
-    ensure_veh();
+    ensure_veh()?;
     let id = BpId(NEXT_ID.fetch_add(1, Ordering::Relaxed));
     let BpSpec { addr, kind, options, hooks, requested_name } = spec;
     match kind {
@@ -93,8 +114,8 @@ pub fn set(spec: BpSpec) -> Result<BpId, BpError> {
         BpKind::Hardware { access, size } => {
             set_hardware(id, addr, access, size, options, hooks, requested_name)
         }
-        BpKind::Page { access, size } => {
-            set_page(id, addr, access, size, options, hooks, requested_name)
+        BpKind::Page { size } => {
+            set_page(id, addr, size, options, hooks, requested_name)
         }
     }
 }
@@ -133,7 +154,6 @@ fn set_software(
 fn set_page(
     id: BpId,
     addr: usize,
-    access: haunt_core::BpAccess,
     size: usize,
     options: BpOptions,
     hooks: BpHooks,
@@ -146,13 +166,13 @@ fn set_page(
     // the page back to its original protection, dropping PAGE_GUARD on
     // every hit).
     reject_page_covering_sw_bp(&reg, addr, size)?;
-    let state = page::install(addr, access, size)?;
+    let state = page::install(addr, size)?;
     reg.insert(
         id,
         Entry::new(
             id,
             addr,
-            BpKind::Page { access, size },
+            BpKind::Page { size },
             options,
             hooks,
             KindState::Page(state),
@@ -171,33 +191,39 @@ fn set_hardware(
     hooks: BpHooks,
     requested_name: Option<String>,
 ) -> Result<BpId, BpError> {
-    let slot = {
-        let mut reg = registry().lock().map_err(|_| BpError::Internal)?;
-        reject_addr_conflict(&reg, addr)?;
-        let slot = allocate_hw_slot(&reg)?;
-        reg.insert(
+    // Hold the registry lock across `hardware::install`. The DR-mutation
+    // sweep inside install enumerates threads and suspends each one
+    // briefly; that's safe under the registry lock because a suspended
+    // thread either holds no haunt-internal lock or is blocked waiting
+    // for the registry lock (and so cannot hold it — `Mutex` is
+    // exclusive). The VEH path that takes registry will be delayed until
+    // the sweep finishes, which is the deliberate cost of correctness.
+    //
+    // Without this, a concurrent `clear()` of a different HW BP could
+    // free a slot we then immediately re-allocate, and the two
+    // apply_to_all_threads sweeps would interleave per-thread, leaving
+    // the loser's DRs in an inconsistent state — i.e. the registry would
+    // claim a BP is installed while DR registers say otherwise.
+    let mut reg = registry().lock().map_err(|_| BpError::Internal)?;
+    reject_addr_conflict(&reg, addr)?;
+    let slot = allocate_hw_slot(&reg)?;
+    // Install before insert: if the kernel call fails there's nothing in
+    // the registry to roll back, and slot allocation is idempotent
+    // because no concurrent allocator can run while we hold the lock.
+    hardware::install(addr, access, size, slot)?;
+    reg.insert(
+        id,
+        Entry::new(
             id,
-            Entry::new(
-                id,
-                addr,
-                BpKind::Hardware { access, size },
-                options,
-                hooks,
-                KindState::Hardware(hardware::State { slot }),
-                requested_name,
-            ),
-        );
-        slot
-    };
-    match hardware::install(addr, access, size, slot) {
-        Ok(()) => Ok(id),
-        Err(e) => {
-            if let Ok(mut reg) = registry().lock() {
-                reg.remove(&id);
-            }
-            Err(e)
-        }
-    }
+            addr,
+            BpKind::Hardware { access, size },
+            options,
+            hooks,
+            KindState::Hardware(hardware::State { slot }),
+            requested_name,
+        ),
+    );
+    Ok(id)
 }
 
 fn reject_addr_conflict(reg: &HashMap<BpId, Entry>, addr: usize) -> Result<(), BpError> {
@@ -260,12 +286,16 @@ fn allocate_hw_slot(reg: &HashMap<BpId, Entry>) -> Result<u8, BpError> {
 }
 
 pub fn clear(id: BpId) -> Result<(), BpError> {
-    // Restore on-CPU / in-memory state BEFORE removing the entry so VEH never
-    // sees "byte still 0xCC / page still PAGE_GUARD but no matching registry
-    // entry" (which would propagate the exception unhandled and crash the host).
-    // HW differs: clearing DR registers requires suspending other threads, which
-    // we can't do under the registry lock — but the race is benign there
-    // (`slot_fired` with no matching entry just clears DR6 and resumes).
+    // Restore on-CPU / in-memory state BEFORE removing the entry so VEH
+    // never sees "byte still 0xCC / page still PAGE_GUARD but no matching
+    // registry entry" (which would propagate the exception unhandled and
+    // crash the host).
+    //
+    // The registry lock is held across hardware::uninstall too. See
+    // `set_hardware` for why that's safe under the apply_to_all_threads
+    // suspend sweep — without it, a concurrent set_hardware could
+    // re-allocate the slot we're about to zero, and the two sweeps would
+    // race per-thread.
     let mut reg = registry().lock().map_err(|_| BpError::Internal)?;
     let entry = reg.get(&id).ok_or(BpError::NotFound)?;
     match &entry.state {
@@ -275,9 +305,20 @@ pub fn clear(id: BpId) -> Result<(), BpError> {
         }
         KindState::Page(s) => {
             page::restore(&s.pages)?;
+            // After restoring (under registry lock), but before
+            // removing the registry entry: mark each page as an orphan
+            // so any thread currently parked in `on_guard_page`
+            // waiting for the registry lock — kernel-clear of
+            // PAGE_GUARD already happened on its fault — can recover
+            // through the orphan path once we release the lock. The
+            // entry is gone; a single take_orphan consumes the marker.
+            // Without this hand-off, the racing thread would find no
+            // registry entry, no orphan, and fall through
+            // EXCEPTION_CONTINUE_SEARCH → host kill.
+            page::mark_pages_for_clear_race_recovery(&s.pages);
         }
         KindState::Hardware(_) => {
-            // Defer: DR clear happens after lock release.
+            // Handled below using the slot from the entry.
         }
     }
     // Removed instead of `expect("present, just verified")`: panic=abort on a
@@ -287,7 +328,6 @@ pub fn clear(id: BpId) -> Result<(), BpError> {
         Some(e) => e,
         None => return Err(BpError::Internal),
     };
-    drop(reg);
 
     if let KindState::Hardware(s) = entry.state {
         hardware::uninstall(s)?;

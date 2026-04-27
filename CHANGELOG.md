@@ -5,6 +5,258 @@ All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+## [0.3.0] - 2026-04-27
+
+### Added
+- **`GET /logs` endpoint and `haunt logs` CLI** for tailing the agent's
+  own `info!` / `warn!` / `error!` output. Mirrors `/events`: bounded
+  ring (4096), monotonic id, long-poll up to 60 s, same `?since=&limit=
+  &timeout=` query shape. Replaces the previous `OutputDebugStringA`
+  sink, which could **block the agent** when a debugger was attached but
+  not draining the LPC queue, mixed output across every process on the
+  box, and required DebugView / a real debugger to consume. The new
+  endpoint flows through the same auth / CSRF / in-flight-cap machinery
+  as everything else and works over SSH the same way.
+
+### Removed
+- **`OutputDebugStringA` log sink** in `haunt-windows` (`DebugStringSink`).
+  Use `haunt logs` to drain the agent's output instead.
+
+### Fixed
+- **Step → continue from a HW BP halt no longer kills the host.**
+  `apply_resume_mode(Step)` set `TRAP_FLAG`; nothing cleared it on the
+  subsequent `Continue` (HW BP path doesn't have a rearm to consume
+  TF, unlike the SW / page paths). The thread resumed with TF=1, the
+  next instruction TF-trapped, `on_single_step` found no rearm / no
+  `STEP::Step` / no DR slot fired, fell through to `EXCEPTION_CONTINUE_
+  SEARCH`, and the OS unhandled-exception filter terminated the host.
+  Reachable from the routine "halt at HW BP, single-step a few times,
+  continue" workflow. Fixed by clearing TF unconditionally at entry to
+  `on_single_step` (with `apply_resume_mode(Step)` re-setting it as the
+  only legitimate post-handler use). The same bug bit any "step ...
+  step ... continue" sequence, not just HW BPs.
+- **Multi-page accesses no longer lose page-BP rearms.**
+  `PENDING_PAGE` was a single `Cell<Option<PageRearm>>`. A misaligned
+  load crossing a page boundary, `rep movs` over multiple pages, or
+  any instruction that traps on more than one guarded page in
+  succession would overwrite the earlier rearm — silently turning the
+  BP one-shot for every page after the first on the very first multi-
+  page hit. Now a `Cell<Vec<PageRearm>>` (capped at 64 entries; uses
+  `Cell::take` / `Cell::set` rather than `RefCell` to stay panic-free).
+- **Failed page-BP installs no longer leak `PAGE_GUARD` orphans.**
+  Two paths produced orphan-guarded pages with no registry entry,
+  killing the host on the next access: (1) `query_protect` failure
+  mid-loop bailed via `?` with no rollback, leaking guards on every
+  already-protected page; (2) `set_protect` failure rolled back, but
+  if a rollback `VirtualProtect` itself failed the page stayed
+  guarded. Both paths now go through one rollback that records any
+  unreversible page in `ORPHAN_PAGES`. The VEH consults the set on a
+  guard fault that doesn't match any registered BP and returns
+  `EXCEPTION_CONTINUE_EXECUTION` instead of propagating to a host
+  kill. Capped at 4 K entries with arbitrary eviction so a degenerate
+  workflow can't grow the set unboundedly.
+- **SW BP install rejects pages that already have `PAGE_GUARD` set.**
+  `write_byte`'s `VirtualProtect(PAGE_EXECUTE_READWRITE)` is page-
+  granular and silently strips `PAGE_GUARD` for the duration of the
+  byte write — defeating the OS stack-growth guard, AV sentinels, JIT
+  runtime traps, and foreign debuggers using `PAGE_GUARD`. Now
+  `VirtualQuery`-checked at install time and rejected with `Conflict`
+  / `409`. Symmetric with `reject_sw_overlapping_page_bp` (which
+  catches haunt's own page BPs); this catches third-party guards.
+- **`clear()` racing an in-flight SW BP hit no longer kills the host.**
+  `clear()` could restore the original byte and remove the registry
+  entry between the int3 firing and `on_int3` acquiring the registry
+  lock. The CPU's saved IP points past the int3 byte (int3 is a trap),
+  so resuming as-is would skip the original instruction (single-byte)
+  or land mid-instruction (multi-byte). `on_int3` now reads the byte
+  via `ReadProcessMemory` on a missed lookup: if it's no longer
+  `0xCC`, rewind IP to the original-byte address and `CONTINUE_
+  EXECUTION` so the original instruction re-executes. If the byte is
+  still `0xCC`, propagate (compiler-emitted int3, third-party hook).
+- **`clear()` racing an in-flight page BP fault no longer kills the
+  host.** Symmetric race: `clear()` restored protections and removed
+  the entry while another thread was parked in `on_guard_page` waiting
+  for the registry lock. After `page::restore` (under the lock),
+  `clear()` now marks each affected page in `ORPHAN_PAGES` so the
+  racing thread recovers via the orphan path on the next lookup. The
+  marker is consumed by the first `take_orphan` call.
+- **`read_cstr_bounded` clamps by readable region as well as length.**
+  The 4 KB hard cap limited *how many* bytes we'd walk but not whether
+  the bytes were mapped. A malformed PE — or a normal PE with the
+  export string table abutting an unmapped page — would let
+  `from_raw_parts(ptr, 4096)` AV partway through the NUL scan. Now
+  also bounds by `VirtualQuery`'s region tail, returning `None` if the
+  page is uncommitted, `PAGE_NOACCESS`, or `PAGE_GUARD`.
+- **`PENDING_PAGE` survives thread-local teardown.** `Cell<Vec<...>>`
+  has a destructor; the thread-local runtime runs it at thread exit.
+  After that, `LocalKey::with` panics — which under `panic = "abort"`
+  kills the host. A SW BP on a function called from another DLL's
+  `DLL_THREAD_DETACH` could fire inside that window. Switched the
+  push/drain sites to `try_with`, silently treating the page-rearm
+  buffer as empty when it's gone (correct degradation: the page BP
+  becomes one-shot for this teardown-bound thread).
+- **`haunt read` / `haunt read-raw` surface partial-content responses.**
+  The agent returns `206 Partial Content` with the readable prefix when
+  a `/memory/read` crosses an unmapped page; the CLI's `request()`
+  collapsed every 2xx to "success, here's the body," so a truncated read
+  printed the prefix to stdout with no signal that fewer bytes than
+  requested came back. Added a `request_full` helper that exposes the
+  HTTP status; `cmd_read` now writes a stderr warning of the form
+  `read truncated at unmapped boundary: N/M bytes returned`.
+- **`resume --ret` no longer takes the PEB loader lock.** The validation
+  that `[xSP]` points into executable code went through `modules::list()`
+  → `CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, ...)`, which acquires
+  the loader lock — running from the VEH path on the resuming thread,
+  this created a deadlock vector if any other thread was simultaneously
+  in our VEH blocked on the registry lock while holding the loader lock
+  (e.g., faulted inside `LdrpLoadDll`). Replaced with a single
+  `VirtualQuery` checking for committed, executable, non-`PAGE_GUARD`
+  memory. As a side effect, run-to-ret now also accepts JIT regions
+  (V8, .NET CLR, JVM, runtime-patched code) — the previous module-only
+  check rejected them.
+- **Page BPs on data pages no longer crash the host.** `on_guard_page`
+  dispatched off `record.ExceptionAddress`, which is the *instruction
+  pointer* at fault time. For read/write watchpoints on data pages the IP
+  sits in the code segment (not the guarded page), so `find_containing`
+  returned `None`, the handler returned `EXCEPTION_CONTINUE_SEARCH`, and
+  the OS terminated the host. Now reads `ExceptionInformation[1]` (the
+  actual address that tripped PAGE_GUARD), with a `NumberParameters >= 2`
+  guard.
+- **TOCTOU between `find_containing` and the entry-mutation lock in
+  `on_guard_page`.** The handler took the registry lock, looked up the
+  page, dropped the lock, then re-acquired to bump hits. A concurrent
+  `clear()` in the gap left no entry on the second lookup → `CONTINUE_
+  SEARCH` → host kill (PAGE_GUARD already auto-cleared). Folded into a
+  single lock acquisition.
+- **`set_breakpoint` on a byte already containing `0xCC` is rejected.**
+  The previous install would record `0xCC` as the original byte; on the
+  first hit, `on_int3` would restore "the original" (still `0xCC`), the
+  CPU would re-execute it, raise `EXCEPTION_BREAKPOINT` again, and loop
+  forever — TF never gets a chance because the int3 fires before the
+  single-step. Now returns `Conflict`.
+- **Worker thread spawn failure no longer aborts the host.** The accept
+  loop used `std::thread::spawn`, which is `Builder::new().spawn().
+  unwrap()` — under handle/quota exhaustion the unwrap panicked, and
+  `panic = "abort"` killed the host. Now uses `Builder::spawn` and logs
+  the failure, dropping the request (slot guard's Drop releases the
+  counter).
+- **`page::install` integer overflow.** `(end + ps - 1)` was unchecked;
+  for `addr` near `usize::MAX` it wrapped to a small value, `end_page`
+  became 0, and the install loop ran zero iterations — a silently-empty
+  page BP that never fires. Now uses `checked_add`.
+- **`AddVectoredExceptionHandler` failure surfaced as `BpError::
+  Internal`.** Previously the NULL return was discarded; every BP became
+  a no-op that propagated to the OS default handler and crashed the
+  host. The install result is now stored in the `OnceLock` so subsequent
+  callers see the same failure rather than re-running the closure (which
+  `get_or_init` only does once).
+- **HW BP snapshot publication races on enable and disable.** Atomic
+  ordering was Relaxed; a new thread's `DLL_THREAD_ATTACH` could observe
+  `SNAP_DR7` enabled without observing the matching `SNAP_DR[slot]`
+  (enable: stale slot value; disable: BP at address 0). `SNAP_DR7`'s
+  CAS is now Release / Acquire-paired with the reader, and disable
+  inverts the publish order (DR7 cleared first, DR[slot]=0 second) so a
+  reader can never see "DR7 enabled + DR[slot]=0".
+- **`apply_to_all_threads` skips agent worker threads, not just
+  `tid_self`.** A HW BP on, e.g., `ntdll!RtlAllocateHeap` previously
+  applied to every agent worker; VEH refused to halt them but still
+  emitted log/event records, flooding the rings on every internal
+  allocation.
+- **`events::shutdown()` and `logs::shutdown()` now actually unblock
+  pollers.** The previous implementation just `notify_all`-ed; pollers
+  woke, found nothing changed, re-checked their (still pending) deadline,
+  and `wait_timeout` again — they'd block until their per-call timeout
+  (≤60 s). Mirrors the `shutting_down` flag pattern already used in
+  `breakpoint::halt::shutdown`.
+- **`read_cstr_bounded` capped at 4 KB.** Walking byte-by-byte through
+  `module_size` bytes to find a NUL would AV inside the agent if the
+  module mapping had an unmapped hole — fatal under `panic = "abort"`.
+  Real export names and forwarder strings are well under 4 KB.
+- **`halt_and_wait` distinguishes "parked then resumed" from "could not
+  park".** Returns `Option<ResumeMode>` instead of falsely reporting
+  `Continue` on event-creation failure / shutdown / lock poisoning. The
+  HW-BP dispatch loop in `on_single_step` no longer breaks early on a
+  halt that didn't actually happen, so subsequent BPs that fired on the
+  same instruction get their hooks run.
+- **`apply_to_all_threads` failure Vec pre-reserved.** Suspended-thread
+  paths still don't push, but pre-reserving documents the
+  no-realloc-while-suspended invariant defensively for future edits.
+- **`setregs` is now a merge, not a destructive overwrite.** The previous
+  flow built a default-zeroed `Registers` from the parsed body and applied
+  it whole, so `printf 'rax=0\n' | haunt setregs N && haunt resume N`
+  zeroed `rip`, `rsp`, and every other register the user did not name —
+  resuming the thread into a guaranteed crash. `parse_regs` now returns a
+  `Vec<(RegName, u64)>` patch; `Process::halt_set_regs` merges under the
+  same lock as `resume()` so there's no race window. Unknown register
+  names return `400` with the offending name instead of being silently
+  dropped (previous behaviour combined with the overwrite turned typos
+  into target-process crashes).
+- **`POST /halts/<id>/regs` body capped at 64 KB.** The handler used
+  `read_to_string` with no upper bound; a malicious or buggy multi-GB
+  POST allocated without limit, and `panic = "abort"` turned the OOM into
+  a host-process kill.
+- **HW breakpoint slot reuse race fixed.** `set_hardware`/`clear` now
+  hold the registry lock across `apply_to_all_threads`, serialising the
+  DR-mutation sweep with any concurrent install/uninstall. Previously a
+  `clear()` of one HW BP racing a `set()` of another could leave the new
+  BP marked installed in the registry while its DR slot was zeroed by
+  the loser-runs-second sweep.
+- **DR7 LE bit no longer diverges between snapshot and per-thread
+  CONTEXT.** A latent bug in the per-CONTEXT writer left `LE=1` after
+  the last slot was disabled, while the atomic snapshot correctly cleared
+  it. New threads (which read the snapshot in `DLL_THREAD_ATTACH`) and
+  existing threads disagreed. Both paths now share `encode_dr7_slot`.
+- **CLI `args` no longer panics on partial reads.** A `206` (partial
+  content) on the bulk stack-slot fetch produced a `try_into().unwrap()`
+  panic; the truncation now reports on stderr and the readable args
+  print normally.
+
+### Changed (breaking)
+- **Strict validation across the board.** Per the new policy in
+  `AGENTS.md`, every parameter that takes a constrained value rejects
+  unrecognised input with a `400` and a message that names the offending
+  parameter. Previously many handlers fell back silently to defaults.
+  Specific cases:
+  - `POST /halts/<id>/resume?mode=<x>` rejects `mode=` other than
+    `continue|step|ret`.
+  - `GET /halts/<id>/stack?depth=<x>` rejects non-numeric `depth`.
+  - `POST /bp/set?kind=sw&access=...` and `?kind=sw&size=...` reject
+    `access`/`size` (only valid with `kind=hw` or `kind=page`).
+  - `POST /bp/set?kind=page&access=...` rejects `access` entirely
+    (PAGE_GUARD has no per-kind selectivity).
+  - `GET /events?since=&limit=&timeout=` and
+    `GET /memory/search?start=&end=&limit=` reject non-numeric values
+    (previously fell back to defaults).
+  - `GET /memory/read?addr=&len=` and `POST /memory/write?addr=` and
+    `GET /symbols/lookup?addr=` and `POST /bp/clear?id=` likewise.
+  - CLI `haunt resume <id> [--continue|--step|--ret]` rejects unknown
+    flags and conflicting mode flags.
+  - `parse_access` no longer accepts the undocumented `r` alias for
+    `any`.
+- **`BpKind::Page` no longer carries an `access` field**; PAGE_GUARD
+  fires on any access kind, and the field was already ignored. `bp list`
+  output for page BPs is now `page/size=N` (was `page/any/size=N`).
+- **`/halts/<id>/regs` POST body** is parsed as a patch, not a full
+  register snapshot; both `rax` and `eax` (and the other r* / e*
+  spellings) are accepted, and the merge happens platform-side.
+- `MAX_LONG_POLL_TIMEOUT_MS` is the single source of truth for the 60 s
+  long-poll cap (was duplicated as `MAX_WAIT_TIMEOUT_MS` and
+  `MAX_TIMEOUT_MS` across `core/lib.rs`, `windows/breakpoint/halt.rs`,
+  and `core/events.rs`).
+- `bp set` success response now ends with `\n`, matching every other
+  line-formatted endpoint.
+
+### Internal
+- The `_Unwind_Resume` stub for i686-pc-windows-gnu lives once in
+  `haunt-core` instead of being duplicated in every binary crate.
+- DR7 bit-encoding extracted to `encode_dr7_slot()` in
+  `windows/breakpoint/hardware.rs`.
+- CLI URL-encodes the addr parameter on `bp set`, `read`, `read-raw`,
+  `write` (was raw, so a typo containing `&`/`+`/`%` would have
+  corrupted the query).
+
 ## [0.2.0] - 2026-04-26
 
 ### Added

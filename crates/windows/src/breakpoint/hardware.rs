@@ -137,7 +137,12 @@ pub fn slot_fired(dr6: u64, slot: u8) -> bool {
 /// from inside DllMain (`format!` would allocate). See `attach_counters`
 /// and the `/threads` endpoint for visibility.
 pub fn apply_current_thread() {
-    let dr7 = SNAP_DR7.load(Ordering::Relaxed);
+    // Acquire on SNAP_DR7 pairs with the Release on the snapshot_write CAS
+    // success, establishing happens-before for the subsequent SNAP_DR[i]
+    // loads. Without it, a new thread can observe SNAP_DR7's slot enable
+    // bit without observing the matching SNAP_DR[slot] address — a HW BP
+    // pointed at zero (or a stale slot value).
+    let dr7 = SNAP_DR7.load(Ordering::Acquire);
     if dr7 == 0 {
         return;
     }
@@ -174,32 +179,68 @@ pub fn apply_current_thread() {
 }
 
 fn snapshot_write(slot: u8, addr: u64, rw: u8, len: u8, enable: bool) {
-    SNAP_DR[slot as usize].store(if enable { addr } else { 0 }, Ordering::Relaxed);
+    // Publication order matters in BOTH directions to prevent a reader
+    // from observing an inconsistent (DR7 bit, DR[slot] value) pair:
+    //
+    //   Enable:  write DR[slot]=newaddr, then DR7 enable bit set.
+    //            Reader who sees old DR7 (no enable) sees no BP — safe.
+    //            Reader who sees new DR7 (Acquire) is also guaranteed to
+    //            see new DR[slot] via the Release/Acquire pair.
+    //
+    //   Disable: write DR7 clear FIRST, then DR[slot]=0. If we did it
+    //            the other way, a reader could observe (old DR7=enabled,
+    //            new DR[slot]=0) and install a HW BP pointed at address
+    //            zero — fires on every null deref.
+    //
+    // The Release on the CAS publishes the in-order writes; the Acquire
+    // on the read side picks them up.
+    if enable {
+        SNAP_DR[slot as usize].store(addr, Ordering::Relaxed);
+    }
+    let mut current = SNAP_DR7.load(Ordering::Relaxed);
+    loop {
+        let new_val = encode_dr7_slot(current, slot, rw, len, enable);
+        match SNAP_DR7.compare_exchange_weak(
+            current, new_val, Ordering::Release, Ordering::Relaxed,
+        ) {
+            Ok(_) => break,
+            Err(v) => current = v,
+        }
+    }
+    if !enable {
+        SNAP_DR[slot as usize].store(0, Ordering::Relaxed);
+    }
+}
 
+/// Patch DR7's per-slot bits to enable or disable a hardware breakpoint.
+/// Slot fields per the Intel SDM Vol 3B §17.2:
+/// - bit `slot*2`     — Local Enable for this slot (Lx)
+/// - bits `16+slot*4..` — R/W type (00 exec, 01 write, 11 readwrite)
+/// - bits `18+slot*4..` — LEN (00 1B, 01 2B, 10 8B-on-x64, 11 4B)
+/// - bit 8 — LE (Local Exact Breakpoint Enable); set whenever any slot
+///   is enabled, cleared once all are disabled.
+///
+/// Pure function over `u64` so both the atomic-snapshot CAS loop and the
+/// per-thread CONTEXT writer can call it. Keeps the bit layout in one
+/// place — getting either copy out of sync used to leave threads with
+/// stale R/W or LEN bits while the snapshot looked clean.
+fn encode_dr7_slot(dr7: u64, slot: u8, rw: u8, len: u8, enable: bool) -> u64 {
     let local_bit = 1u64 << (slot * 2);
     let rw_shift = 16 + slot * 4;
     let len_shift = 18 + slot * 4;
     let rw_mask = 0b11u64 << rw_shift;
     let len_mask = 0b11u64 << len_shift;
 
-    let mut current = SNAP_DR7.load(Ordering::Relaxed);
-    loop {
-        let mut new_val = current & !(local_bit | rw_mask | len_mask);
-        if enable {
-            new_val |= local_bit;
-            new_val |= (rw as u64 & 0b11) << rw_shift;
-            new_val |= (len as u64 & 0b11) << len_shift;
-            new_val |= 1u64 << 8; // LE
-        } else if new_val & 0xFFu64 == 0 {
-            new_val &= !(1u64 << 8); // no slots active, drop LE
-        }
-        match SNAP_DR7.compare_exchange_weak(
-            current, new_val, Ordering::Relaxed, Ordering::Relaxed,
-        ) {
-            Ok(_) => break,
-            Err(v) => current = v,
-        }
+    let mut new_val = dr7 & !(local_bit | rw_mask | len_mask);
+    if enable {
+        new_val |= local_bit;
+        new_val |= (rw as u64 & 0b11) << rw_shift;
+        new_val |= (len as u64 & 0b11) << len_shift;
+        new_val |= 1u64 << 8; // LE
+    } else if new_val & 0xFFu64 == 0 {
+        new_val &= !(1u64 << 8); // no slots active, drop LE
     }
+    new_val
 }
 
 fn encode_access(access: BpAccess) -> Result<u8, BpError> {
@@ -240,11 +281,28 @@ where
     F: FnMut(&mut CONTEXT),
 {
     let tid_self = unsafe { GetCurrentThreadId() };
+    // Skip every agent-owned thread, not just `tid_self`. If we set a HW
+    // BP on, say, `ntdll!RtlAllocateHeap`, applying it to the agent's own
+    // worker threads means every internal allocation in the agent fires
+    // the BP — VEH refuses to halt agent threads but still emits log /
+    // event records, flooding the rings. Reading the snapshot once
+    // (rather than calling `is_agent` per-thread, which is TLS-local and
+    // wouldn't work cross-thread anyway) gives a consistent view.
+    let agents: std::collections::HashSet<u32> =
+        haunt_core::thread_role::agent_tids().into_iter().collect();
     let mut applied = 0u32;
     let mut skipped = 0u32;
-    let mut failures: Vec<ApplyFailure> = Vec::new();
+    // Pre-reserve so that `failures.push` inside the per-thread loop never
+    // reallocates. Vec reallocation goes through the global allocator; if
+    // a foreign thread (not yet visited by this sweep) holds the heap
+    // lock, the realloc would block. We're not currently suspending any
+    // thread when we push (push only happens before SuspendThread or
+    // after ResumeThread for the just-finished thread), but pre-reserving
+    // makes that property robust to future edits to the loop body.
+    const FAILURES_CAP: usize = 64;
+    let mut failures: Vec<ApplyFailure> = Vec::with_capacity(FAILURES_CAP);
     enumerate_threads(|tid| {
-        if tid == tid_self {
+        if tid == tid_self || agents.contains(&tid) {
             return;
         }
         unsafe {
@@ -335,19 +393,6 @@ where
 }
 
 fn set_ctx_dr7(ctx: &mut CONTEXT, slot: u8, rw: u8, len: u8, enable: bool) {
-    let local_bit = 1u64 << (slot * 2);
-    let rw_shift = 16 + slot * 4;
-    let len_shift = 18 + slot * 4;
-    let rw_mask = 0b11u64 << rw_shift;
-    let len_mask = 0b11u64 << len_shift;
-
-    let mut dr7 = arch::dr7(ctx);
-    dr7 &= !(local_bit | rw_mask | len_mask);
-    if enable {
-        dr7 |= local_bit;
-        dr7 |= (rw as u64 & 0b11) << rw_shift;
-        dr7 |= (len as u64 & 0b11) << len_shift;
-        dr7 |= 1u64 << 8; // LE
-    }
+    let dr7 = encode_dr7_slot(arch::dr7(ctx), slot, rw, len, enable);
     arch::set_dr7(ctx, dr7);
 }

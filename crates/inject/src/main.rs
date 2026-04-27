@@ -5,15 +5,6 @@
 
 #![cfg(windows)]
 
-// MinGW i686 + panic=abort still references _Unwind_Resume from stdlib's
-// alloc. Stub it — panic=abort already guarantees any unwind path ends in
-// process abort.
-#[cfg(all(target_arch = "x86", target_env = "gnu"))]
-#[no_mangle]
-pub extern "C" fn _Unwind_Resume() -> ! {
-    std::process::abort()
-}
-
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;

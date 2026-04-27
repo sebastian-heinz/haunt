@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use haunt_core::{BpError, BpId, HaltSummary, Registers, ResumeMode};
+use haunt_core::{BpError, BpId, HaltSummary, RegName, Registers, ResumeMode, MAX_LONG_POLL_TIMEOUT_MS};
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::System::Diagnostics::Debug::CONTEXT;
 use windows_sys::Win32::System::Threading::{
@@ -14,11 +14,6 @@ use windows_sys::Win32::System::Threading::{
 };
 
 use super::arch;
-
-/// Cap on `/halts/wait` long-poll. Without it, a client sending
-/// `?timeout=u64::MAX` parks an agent worker for ~584 million years.
-/// `events::poll` already enforces the same cap.
-pub const MAX_WAIT_TIMEOUT_MS: u64 = 60_000;
 
 pub struct HaltedHit {
     pub hit_id: u64,
@@ -60,11 +55,17 @@ fn cv() -> &'static Condvar {
     CV.get_or_init(Condvar::new)
 }
 
-/// Park the calling thread. Returns the `ResumeMode` requested by the client.
-/// On wake, any register modifications are written back into `ctx`. Refuses
-/// to park if `shutdown()` was called — a halt that arrives during teardown
-/// would never receive its `resume` and would zombie the thread.
-pub fn halt_and_wait(bp_id: Option<BpId>, ctx: &mut CONTEXT) -> ResumeMode {
+/// Park the calling thread. Returns `Some(ResumeMode)` once a client
+/// resume request wakes the thread (or shutdown sweeps it). Returns
+/// `None` if we were unable to park — event-creation failure, mutex
+/// poisoning, or shutdown-already-in-progress when we tried to register.
+/// On a real wake, any register modifications are written back into `ctx`.
+///
+/// Callers must distinguish None from Some: previously this returned
+/// `ResumeMode::Continue` on every failure path, which let the HW-BP
+/// dispatch loop in `on_single_step` think a halt actually happened and
+/// `break` past any subsequent BPs that fired on the same instruction.
+pub fn halt_and_wait(bp_id: Option<BpId>, ctx: &mut CONTEXT) -> Option<ResumeMode> {
     let tid = unsafe { GetCurrentThreadId() };
 
     // auto-reset event, initially not signaled. Created before the lock so
@@ -72,7 +73,7 @@ pub fn halt_and_wait(bp_id: Option<BpId>, ctx: &mut CONTEXT) -> ResumeMode {
     // on every error path below.
     let event = unsafe { CreateEventA(std::ptr::null(), 0, 0, std::ptr::null()) };
     if event.is_null() || event == INVALID_HANDLE_VALUE {
-        return ResumeMode::Continue;
+        return None;
     }
 
     // Insert under the lock and re-check shutdown there. The combined
@@ -83,7 +84,7 @@ pub fn halt_and_wait(bp_id: Option<BpId>, ctx: &mut CONTEXT) -> ResumeMode {
         Ok(mut guard) => {
             if guard.shutting_down {
                 unsafe { CloseHandle(event) };
-                return ResumeMode::Continue;
+                return None;
             }
             let hit_id = guard.next_hit_id;
             guard.next_hit_id = guard.next_hit_id.wrapping_add(1);
@@ -103,7 +104,7 @@ pub fn halt_and_wait(bp_id: Option<BpId>, ctx: &mut CONTEXT) -> ResumeMode {
         }
         Err(_) => {
             unsafe { CloseHandle(event) };
-            return ResumeMode::Continue;
+            return None;
         }
     };
 
@@ -145,7 +146,7 @@ pub fn halt_and_wait(bp_id: Option<BpId>, ctx: &mut CONTEXT) -> ResumeMode {
         arch::apply_regs(ctx, &r);
     }
 
-    mode
+    Some(mode)
 }
 
 pub fn list() -> Vec<HaltSummary> {
@@ -160,12 +161,12 @@ pub fn list() -> Vec<HaltSummary> {
 }
 
 /// Return the oldest parked halt whose `hit_id > since`, blocking up to
-/// `timeout_ms` (capped at `MAX_WAIT_TIMEOUT_MS`) if none qualify yet.
+/// `timeout_ms` (capped at `MAX_LONG_POLL_TIMEOUT_MS`) if none qualify yet.
 /// Determinism matters: at high BP rate a caller polling `wait, regs,
 /// resume, wait` needs to know it gets the next hit in order, not a random
 /// hash-bucket pick.
 pub fn wait(timeout_ms: u64, since: u64) -> Option<HaltSummary> {
-    let timeout_ms = timeout_ms.min(MAX_WAIT_TIMEOUT_MS);
+    let timeout_ms = timeout_ms.min(MAX_LONG_POLL_TIMEOUT_MS);
     let mut guard = halts().lock().ok()?;
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
 
@@ -229,11 +230,20 @@ pub fn get_regs(hit_id: u64) -> Option<Registers> {
     g.halts.get(&hit_id).map(|h| h.regs)
 }
 
-pub fn set_regs(hit_id: u64, regs: Registers) -> Result<(), BpError> {
+/// Apply a partial register patch to the parked thread's saved CONTEXT.
+/// Each `(name, value)` overwrites exactly one slot — any register the
+/// caller did not name keeps its captured-at-halt value. The merge
+/// happens under the same lock that `resume()` takes, so a concurrent
+/// resume cannot race a half-applied patch onto the wire.
+pub fn set_regs(hit_id: u64, patch: &[(RegName, u64)]) -> Result<(), BpError> {
     let mut g = halts().lock().map_err(|_| BpError::Internal)?;
     let h = g.halts.get_mut(&hit_id).ok_or(BpError::NotFound)?;
-    h.regs = regs;
-    h.modified = true;
+    for &(name, value) in patch {
+        name.write(&mut h.regs, value);
+    }
+    if !patch.is_empty() {
+        h.modified = true;
+    }
     Ok(())
 }
 
