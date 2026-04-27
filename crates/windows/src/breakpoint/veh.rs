@@ -396,15 +396,20 @@ fn apply_resume_mode(mode: ResumeMode, context: &mut CONTEXT) {
     }
 }
 
-/// Evaluate the BP's `cond` hook (if any), render its `log` template (if any),
-/// emit the rendered record to the log pipeline + the events ring buffer, then
-/// halt the thread iff `options.halt` AND the condition passed. Returns `true`
-/// only when the thread was actually parked — used by the HW path to decide
-/// whether to keep running other BPs that fired in the same VEH invocation.
+/// Evaluate the BP's split gates, render its `log` template (gated by
+/// `log_cond`), emit the rendered record to the log pipeline + the events
+/// ring buffer, then halt the thread iff `options.halt` AND `halt_cond`
+/// passed. Returns `true` only when the thread was actually parked —
+/// used by the HW path to decide whether to keep running other BPs that
+/// fired in the same VEH invocation.
 ///
-/// Cond semantics: if `cond` is set and evaluates to zero, the BP is treated
-/// as a no-fire — no log, no event, no halt — though `entry.hits` was already
-/// incremented by the caller so the bare hit count still reflects reality.
+/// Gate semantics:
+/// - `log_cond` (Some/zero): no log, no event. Halt is independent.
+/// - `halt_cond` (Some/zero): no park, even when `options.halt = true`.
+///   Log + event are independent.
+/// - `entry.hits` is incremented by the caller before either gate, so
+///   the bare hit count is the raw fire count — independent of gates
+///   and independent of `tid_filter`.
 unsafe fn run_hooks_then_maybe_halt(
     bp_id: BpId,
     options: BpOptions,
@@ -414,51 +419,58 @@ unsafe fn run_hooks_then_maybe_halt(
     let regs = arch::extract_regs(context);
     let ctx = HitEvalCtx { regs };
 
-    let cond_passed = match &hooks.cond {
-        Some(cond) => dsl::eval(&cond.expr, &ctx).unwrap_or(0) != 0,
+    // log gate first: rendering happens unconditionally so `--log` works
+    // without any condition, and is suppressed by `--log-if` when set
+    // and zero. Halt path is fully independent below.
+    let log_passed = match &hooks.log_cond {
+        Some(c) => dsl::eval(&c.expr, &ctx).unwrap_or(0) != 0,
         None => true,
     };
-    if !cond_passed {
+    if log_passed {
+        if let Some(template) = &hooks.log {
+            emit_log_event(bp_id, &ctx, &template.parts);
+        }
+    }
+
+    if !options.halt {
         return false;
     }
-
-    if let Some(template) = &hooks.log {
-        emit_log_event(bp_id, &ctx, &template.parts);
+    // Refuse to park if this hit fired on an agent-owned thread —
+    // the agent's HTTP server (or one of its per-request workers)
+    // would deadlock waiting for a `resume` that itself can only
+    // arrive via the parked thread. Auto-promote to no-halt + warn.
+    if thread_role::is_agent() {
+        warn!(
+            "bp {} would halt agent thread (tid={}); auto-promoting to no-halt",
+            bp_id.0,
+            unsafe { GetCurrentThreadId() },
+        );
+        return false;
     }
-
-    if options.halt {
-        // Refuse to park if this hit fired on an agent-owned thread —
-        // the agent's HTTP server (or one of its per-request workers)
-        // would deadlock waiting for a `resume` that itself can only
-        // arrive via the parked thread. Auto-promote to no-halt + warn.
-        if thread_role::is_agent() {
+    let halt_passed = match &hooks.halt_cond {
+        Some(c) => dsl::eval(&c.expr, &ctx).unwrap_or(0) != 0,
+        None => true,
+    };
+    if !halt_passed {
+        return false;
+    }
+    match halt::halt_and_wait(Some(bp_id), context) {
+        Some(mode) => {
+            apply_resume_mode(mode, context);
+            true
+        }
+        None => {
+            // Park failed (event creation, lock, or shutdown). The
+            // thread will continue without halting; return false so
+            // the HW-BP dispatch loop keeps running other BPs that
+            // fired on the same instruction instead of breaking
+            // early on a halt that didn't actually happen.
             warn!(
-                "bp {} would halt agent thread (tid={}); auto-promoting to no-halt",
+                "bp {} halt could not park; thread continues",
                 bp_id.0,
-                unsafe { GetCurrentThreadId() },
             );
-            return false;
+            false
         }
-        match halt::halt_and_wait(Some(bp_id), context) {
-            Some(mode) => {
-                apply_resume_mode(mode, context);
-                true
-            }
-            None => {
-                // Park failed (event creation, lock, or shutdown). The
-                // thread will continue without halting; return false so
-                // the HW-BP dispatch loop keeps running other BPs that
-                // fired on the same instruction instead of breaking
-                // early on a halt that didn't actually happen.
-                warn!(
-                    "bp {} halt could not park; thread continues",
-                    bp_id.0,
-                );
-                false
-            }
-        }
-    } else {
-        false
     }
 }
 
@@ -577,13 +589,23 @@ fn install_run_to_ret(context: &mut CONTEXT) {
         return;
     }
     let tid = unsafe { GetCurrentThreadId() };
-    let _ = super::set(BpSpec {
+    if let Err(e) = super::set(BpSpec {
         addr: ret_addr,
         kind: BpKind::Software,
         options: BpOptions { halt: true, one_shot: true, tid_filter: Some(tid) },
         hooks: BpHooks::default(),
         requested_name: None,
-    });
+    }) {
+        // Silent failure here is the worst outcome — `resume --ret`
+        // returns 200 to the client and the thread runs free past the
+        // function with no halt. Common causes: an existing BP at the
+        // return address (Conflict), unwritable code page, or VEH
+        // install having failed earlier. Surface the failure so it
+        // shows up in `haunt logs`.
+        warn!(
+            "ret mode: failed to plant one-shot SW BP at 0x{ret_addr:x}: {e:?}"
+        );
+    }
 }
 
 /// True if `addr` is in a committed, executable memory region. Used to

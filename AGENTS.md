@@ -1,5 +1,20 @@
 # AGENTS.md
 
+- **Threat model: in-process, not adversarial.** haunt runs as a DLL
+  inside the user's target — we share the host's address space and
+  every lock the host takes. There is no network attacker to defend
+  against; the user owns the box. Loopback-only HTTP with opt-in auth
+  is all the security work we do, and we will not invest more there.
+
+  What we *do* care about, with no compromise: **correctness, zero
+  bugs, no surprises**. A single panic kills the host. A silent
+  default — "user typoed `--halft-if`, treat it like the BP had no
+  gate" — produces a target-process bug that surfaces hours later as
+  "haunt did something different than I asked." Strict validation,
+  panic-free hot paths, no `unwrap` / `expect`, no `unwrap_or` on
+  user-supplied input, no silently-ignored flags or query params, no
+  silent clamping — all non-negotiable. Not because of attackers,
+  because we live in someone else's process and any bug is their bug.
 - Workspace cross-compiles to `x86_64-pc-windows-gnu` by default; for
   32-bit, `--target i686-pc-windows-gnu`. `cargo run` won't execute on
   non-Windows hosts.

@@ -142,26 +142,43 @@ haunt bp list                          # hit counts per BP
 ```
 
 **Trace at line rate (dtrace-style).** `--log <template>` evaluates
-on every hit and emits to a 4096-record ring buffer. `--if <expr>`
-gates emission on a condition.
+on every hit and emits to a 4096-record ring buffer. `--log-if` and
+`--halt-if` are independent gates: log/event emission and halt are
+controlled separately, so a single BP can log every call and halt
+only on the runs that match a condition.
 
 ```sh
 # Log ecx and *(ecx+8) on every call to a 200/sec hot function:
 haunt bp set CryGame.dll!OnPacket --no-halt \
   --log "ecx=%ecx [ecx+8]=%[ecx+8]"
 
-# Halt only when a specific value flows through:
-haunt bp set 0x7FF601234ABC --if "ecx == 0x281"
+# Halt only when a specific value flows through (no --log gate, so
+# halt fires only when the predicate passes — original --if behaviour):
+haunt bp set 0x7FF601234ABC --halt-if "ecx == 0x281"
 
-# Tail the ring buffer (long-poll up to 5 s):
-haunt events --since 0 --timeout 5000
+# Log every call, halt only on a specific run:
+haunt bp set CryGame.dll!OnPacket \
+  --log "type=%ecx [esp+4]=%[esp+4]" \
+  --halt-if "[ecx] == 0x11D1F298"
+
+# Show the most recent 10 records — no since-dance, no long-poll:
+haunt events --tail 10
+
+# Tail the ring buffer with long-poll, filtered to one BP:
+haunt events --since 0 --timeout 5000 --bp-id 4
 ```
 
 Template syntax: `%name` = register, `%[expr]` = deref + value,
 `%{expr}` = raw value, `%%` = literal `%`. Expressions:
 `+ - * & | ^ << >> ~ == != < <= > >= ()` over hex/decimal literals,
-register names, and `[deref]` subexpressions. Conditions are full
-expressions; non-zero passes. Parser depth is capped at 32 levels.
+register names, and `[deref]` subexpressions. Both gate predicates
+take the same syntax; non-zero passes. Parser depth is capped at 32
+levels. `entry.hits` increments on every fire regardless of either
+gate (raw fire count).
+
+`haunt events` and `haunt logs` annotate hex addresses inline as
+`(module+0xoffset)` against `/modules`; pass `--no-annotate` for
+stable output in scripts.
 
 **Range watchpoint.** Page BP + `--no-halt` + `--log` answers "who
 writes into this range?":
@@ -267,7 +284,7 @@ Memory:
 - `GET  /memory/search?pattern=<hex>{&module=<name>|&start=0x...&end=0x...|&all=true}[&limit=N]` — IDA-style hex; `??` = wildcard. Scope required.
 
 Breakpoints:
-- `POST /bp/set?{addr=0x...|name=module!symbol}&kind=sw|hw|page[&access=x|w|rw|any][&size=N][&halt=true|false][&one_shot=true][&tid=N][&log=<template>][&cond=<expr>]`
+- `POST /bp/set?{addr=0x...|name=module!symbol}&kind=sw|hw|page[&access=x|w|rw|any][&size=N][&halt=true|false][&one_shot=true][&tid=N][&log=<template>][&log_if=<expr>][&halt_if=<expr>]`
   - `access`: `x`/`exec`, `w`/`write`, `rw`/`readwrite`, `any`. HW
     requires `size ∈ {1,2,4,8}` (8 is x64-only) and `addr` aligned
     to `size` for `size > 1`. Page rounds `size` up to whole pages.
@@ -285,7 +302,7 @@ Breakpoints:
 - `GET  /bp/list` and `GET /bp/<id>` — entries include `requested=...` for BPs set by name
 
 Trace events:
-- `GET  /events?since=<id>&limit=N&timeout=<ms>` — long-polls up to 60 s
+- `GET  /events?since=<id>&limit=N&timeout=<ms>[&bp_id=<id>][&tail=<n>]` — `since`/`timeout` long-polls up to 60 s; `tail=n` returns the most recent `n` matching records and disables long-polling; `bp_id` filters server-side.
 
 Agent logs:
 - `GET  /logs?since=<id>&limit=N&timeout=<ms>` — agent's own info/warn/

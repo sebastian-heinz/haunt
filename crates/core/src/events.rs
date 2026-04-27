@@ -91,28 +91,45 @@ pub fn push(bp_id: Option<u64>, tid: u32, rip: u64, msg: String) {
     IN_PUSH.with(|f| f.set(false));
 }
 
-/// Return events with `id > since`, up to `limit`. If none qualify and
-/// `timeout_ms > 0`, blocks waiting for new events; returns whatever has
-/// arrived by then (possibly empty).
-pub fn poll(since: u64, limit: usize, timeout_ms: u64) -> Vec<Event> {
+/// Return events matching the optional filters, up to `limit`.
+///
+/// Filters:
+/// - `since`: only events with `id > since` (forward / long-poll mode).
+/// - `bp_id`: only events from this BP (server-side filter — matters
+///   when several BPs fire at high rate and the client only cares about
+///   one).
+/// - `tail`: if `Some(n)`, return the *most recent* up to `n` matching
+///   records in chronological order regardless of `since`. Disables
+///   long-polling — "give me what's already there" is a snapshot, not
+///   a wait. Solves the ring-overflow foot-shape where `since=0` slid
+///   off the front while the caller was setting up.
+///
+/// Long-poll only applies when `tail` is `None` and no records match.
+/// Returns whatever has arrived by `timeout_ms` (possibly empty).
+pub fn poll(
+    since: u64,
+    limit: usize,
+    timeout_ms: u64,
+    bp_id: Option<u64>,
+    tail: Option<usize>,
+) -> Vec<Event> {
     let timeout_ms = timeout_ms.min(MAX_LONG_POLL_TIMEOUT_MS);
     let mut g = match ring().lock() {
         Ok(g) => g,
         Err(_) => return Vec::new(),
     };
+
+    if let Some(n) = tail {
+        return collect_tail(&g.deque, n.min(limit), bp_id);
+    }
+
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
 
     loop {
         if g.shutting_down {
             return Vec::new();
         }
-        let collected: Vec<Event> = g
-            .deque
-            .iter()
-            .filter(|e| e.id > since)
-            .take(limit)
-            .cloned()
-            .collect();
+        let collected = collect_forward(&g.deque, since, limit, bp_id);
         if !collected.is_empty() || timeout_ms == 0 {
             return collected;
         }
@@ -127,15 +144,50 @@ pub fn poll(since: u64, limit: usize, timeout_ms: u64) -> Vec<Event> {
         };
         g = g_next;
         if res.timed_out() {
-            return g
-                .deque
-                .iter()
-                .filter(|e| e.id > since)
-                .take(limit)
-                .cloned()
-                .collect();
+            return collect_forward(&g.deque, since, limit, bp_id);
         }
     }
+}
+
+fn collect_forward(
+    deque: &VecDeque<Event>,
+    since: u64,
+    limit: usize,
+    bp_id: Option<u64>,
+) -> Vec<Event> {
+    deque
+        .iter()
+        .filter(|e| e.id > since)
+        .filter(|e| match bp_id {
+            Some(want) => e.bp_id == Some(want),
+            None => true,
+        })
+        .take(limit)
+        .cloned()
+        .collect()
+}
+
+/// Last `n` matching records in chronological (oldest-first) order.
+/// Iterates from the back of the deque, takes the first `n` that match
+/// the optional `bp_id` filter, then reverses so the caller gets ids
+/// in ascending order — same shape `collect_forward` returns.
+fn collect_tail(
+    deque: &VecDeque<Event>,
+    n: usize,
+    bp_id: Option<u64>,
+) -> Vec<Event> {
+    let mut out: Vec<Event> = deque
+        .iter()
+        .rev()
+        .filter(|e| match bp_id {
+            Some(want) => e.bp_id == Some(want),
+            None => true,
+        })
+        .take(n)
+        .cloned()
+        .collect();
+    out.reverse();
+    out
 }
 
 /// Mark the ring as shutting down and wake every waiting poller. Pollers

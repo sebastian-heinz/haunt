@@ -120,12 +120,17 @@ pub fn render(parts: &[TemplatePart], ctx: &dyn Eval) -> String {
     for part in parts {
         match part {
             TemplatePart::Literal(s) => out.push_str(s),
+            // `write!` to a `String` is infallible (`fmt::Write for String`
+            // never returns Err), but the project's no-`unwrap` policy
+            // applies even where the unwrap is provably safe — a future
+            // refactor could swap the sink for something fallible, and a
+            // panic here under `panic = "abort"` would kill the host.
             TemplatePart::Reg(name) => match ctx.reg(name) {
-                Some(v) => write!(out, "0x{v:x}").unwrap(),
+                Some(v) => { let _ = write!(out, "0x{v:x}"); }
                 None => out.push('?'),
             },
             TemplatePart::Expr(e) => match eval(e, ctx) {
-                Some(v) => write!(out, "0x{v:x}").unwrap(),
+                Some(v) => { let _ = write!(out, "0x{v:x}"); }
                 None => out.push('?'),
             },
         }

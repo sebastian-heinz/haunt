@@ -178,32 +178,51 @@ pub struct BpSpec {
     pub requested_name: Option<String>,
 }
 
-/// Server-side evaluated DSL hooks attached to a breakpoint. `cond` gates
-/// halt + log + event emission; if `cond` is `Some(expr)` and the expression
-/// evaluates to zero on hit, the breakpoint silently rearms. `log` is a
-/// template rendered on hit and emitted to both the log pipeline and the
-/// `/events` ring buffer.
+/// Server-side evaluated DSL hooks attached to a breakpoint.
 ///
-/// Each hook keeps both the parsed AST (used by VEH at hit-time) and the
-/// original source text (surfaced by `bp list` / `bp info` so users can
-/// audit what a BP is doing without re-issuing it).
+/// - `log` is a template rendered on hit and emitted to both the log
+///   pipeline and the `/events` ring buffer (gated by `log_cond` if
+///   set).
+/// - `log_cond` gates log + event emission. If `Some(expr)` and the
+///   expression evaluates to zero on hit, no log line and no event
+///   record. Halt is independent.
+/// - `halt_cond` gates halt only. If `Some(expr)` and zero, the BP
+///   does not park the firing thread even when `options.halt = true`.
+///   Log + event emission are independent.
+///
+/// `entry.hits` is incremented on every fire regardless of either
+/// gate — it's the raw fire count.
+///
+/// Splitting the gates lets the user log everything but halt only on
+/// a specific subset (the original feedback that drove this design):
+/// `--log "..." --halt-if "[ecx] == 0x..."` logs every call, halts
+/// only on the runs that match.
+///
+/// Each hook keeps both the parsed AST (used by VEH at hit-time) and
+/// the original source text (surfaced by `bp list` / `bp info` so
+/// users can audit what a BP is doing without re-issuing it).
 #[derive(Debug, Clone, Default)]
 pub struct BpHooks {
     pub log: Option<dsl::TemplateHook>,
-    pub cond: Option<dsl::CondHook>,
+    pub log_cond: Option<dsl::CondHook>,
+    pub halt_cond: Option<dsl::CondHook>,
 }
 
 impl BpHooks {
     pub fn is_empty(&self) -> bool {
-        self.log.is_none() && self.cond.is_none()
+        self.log.is_none() && self.log_cond.is_none() && self.halt_cond.is_none()
     }
 
     pub fn log_text(&self) -> Option<&str> {
         self.log.as_ref().map(|h| h.source.as_str())
     }
 
-    pub fn cond_text(&self) -> Option<&str> {
-        self.cond.as_ref().map(|h| h.source.as_str())
+    pub fn log_cond_text(&self) -> Option<&str> {
+        self.log_cond.as_ref().map(|h| h.source.as_str())
+    }
+
+    pub fn halt_cond_text(&self) -> Option<&str> {
+        self.halt_cond.as_ref().map(|h| h.source.as_str())
     }
 }
 
@@ -214,7 +233,8 @@ pub struct BreakpointInfo {
     pub options: BpOptions,
     pub hits: u64,
     pub log: Option<String>,
-    pub cond: Option<String>,
+    pub log_if: Option<String>,
+    pub halt_if: Option<String>,
     pub requested_name: Option<String>,
 }
 
@@ -655,29 +675,44 @@ fn route(
     let url = req.url().to_string();
     let (path, query) = split_query(&url);
 
+    // Strict query well-formedness: every pair must be `key=value`.
+    // Doing this once in the dispatcher beats per-handler checks; the
+    // failure mode without it is `?foo` (missing `=`) being silently
+    // dropped by `parse_query`, so `bp set ?addr=...&halft_if=...`
+    // sets a BP with no halt gate when the user typoed `halt_if`.
+    if let Err(e) = validate_query(query) {
+        return text(400, &e);
+    }
+
     // Static routes first. Doing this before the dynamic prefix matchers
     // avoids the trap where `/halts/wait` gets routed to handle_halt_sub
     // which can't parse "wait" as a hit_id.
+    //
+    // No-arg static endpoints route through `noarg(query, ...)`, which
+    // 400s on any non-empty query — `/ping?foo=1` returning `pong` was
+    // a silent typo footgun.
     let static_match = match (&method, path) {
-        (Method::Get, "/ping") => Some(text(200, "pong")),
-        (Method::Get, "/version") => Some(text(200, env!("CARGO_PKG_VERSION"))),
-        (Method::Get, "/info") => Some(handle_info(process)),
+        (Method::Get, "/ping") => Some(noarg(query, || text(200, "pong"))),
+        (Method::Get, "/version") => {
+            Some(noarg(query, || text(200, env!("CARGO_PKG_VERSION"))))
+        }
+        (Method::Get, "/info") => Some(noarg(query, || handle_info(process))),
         (Method::Get, "/memory/read") => Some(handle_read(process, query)),
         (Method::Post, "/memory/write") => Some(handle_write(process, query, req)),
         (Method::Post, "/bp/set") => Some(handle_bp_set(process, query)),
         (Method::Post, "/bp/clear") => Some(handle_bp_clear(process, query)),
-        (Method::Get, "/bp/list") => Some(handle_bp_list(process)),
+        (Method::Get, "/bp/list") => Some(noarg(query, || handle_bp_list(process))),
         (Method::Get, "/symbols/resolve") => Some(handle_symbol_resolve(process, query)),
         (Method::Get, "/symbols/lookup") => Some(handle_symbol_lookup(process, query)),
         (Method::Get, "/events") => Some(handle_events(query)),
         (Method::Get, "/logs") => Some(handle_logs(query)),
-        (Method::Get, "/halts") => Some(handle_halts_list(process)),
+        (Method::Get, "/halts") => Some(noarg(query, || handle_halts_list(process))),
         (Method::Get, "/halts/wait") => Some(handle_halts_wait(process, query)),
-        (Method::Get, "/modules") => Some(handle_modules(process)),
-        (Method::Get, "/memory/regions") => Some(handle_regions(process)),
+        (Method::Get, "/modules") => Some(noarg(query, || handle_modules(process))),
+        (Method::Get, "/memory/regions") => Some(noarg(query, || handle_regions(process))),
         (Method::Get, "/memory/search") => Some(handle_memory_search(process, query)),
-        (Method::Get, "/threads") => Some(handle_threads(process)),
-        (Method::Post, "/shutdown") => Some({
+        (Method::Get, "/threads") => Some(noarg(query, || handle_threads(process))),
+        (Method::Post, "/shutdown") => Some(noarg(query, || {
             // Order matters: `shutdown_halts` must run BEFORE we stop
             // accepting requests. The platform impl is responsible for both
             // refusing new parks AND resuming any already-parked threads in
@@ -689,7 +724,7 @@ fn route(
             logs::shutdown();
             server.unblock();
             text(200, "shutting down")
-        }),
+        })),
         _ => None,
     };
     if let Some(r) = static_match {
@@ -700,7 +735,7 @@ fn route(
     if let Some(rest) = path.strip_prefix("/bp/") {
         if method == Method::Get {
             if let Ok(id) = rest.parse::<u64>() {
-                return handle_bp_info(process, BpId(id));
+                return noarg(query, || handle_bp_info(process, BpId(id)));
             }
         }
     }
@@ -714,7 +749,7 @@ fn route(
     if let Some(rest) = path.strip_prefix("/modules/") {
         if method == Method::Get {
             if let Some(name) = rest.strip_suffix("/exports") {
-                return handle_module_exports(process, &percent_decode(name));
+                return noarg(query, || handle_module_exports(process, &percent_decode(name)));
             }
         }
     }
@@ -791,14 +826,20 @@ fn handle_halt_stack(process: &dyn Process, hit_id: u64, query: &str) -> Respons
     // with no signal that the limit fell back.
     let mut depth = STACK_DEFAULT_DEPTH;
     for (k, v) in parse_query(query) {
-        if k == "depth" {
-            match v.parse::<usize>() {
+        match k {
+            "depth" => match v.parse::<usize>() {
                 Ok(n) => depth = n,
                 Err(_) => return text(400, "depth: not a number"),
-            }
+            },
+            _ => return text(400, &format!("unknown query param: {k}")),
         }
     }
-    let depth = depth.clamp(1, STACK_MAX_DEPTH);
+    if depth == 0 {
+        return text(400, "depth: must be > 0");
+    }
+    if depth > STACK_MAX_DEPTH {
+        return text(400, &format!("depth: must be <= {STACK_MAX_DEPTH}"));
+    }
 
     let frames = process.stack_walk(hit_id, depth);
     if frames.is_empty() {
@@ -842,7 +883,13 @@ fn resolve_addr(modules: &[ModuleInfo], addr: u64) -> Option<(&str, usize)> {
 ///   `?mode=stp` (instead of `step`) used to silently `Continue`, which
 ///   meant the user thought they single-stepped while the thread ran free.
 fn parse_resume_mode(query: &str) -> Result<ResumeMode, String> {
-    let raw = parse_query(query).find(|(k, _)| *k == "mode").map(|(_, v)| v);
+    let mut raw: Option<String> = None;
+    for (k, v) in parse_query(query) {
+        match k {
+            "mode" => raw = Some(v),
+            _ => return Err(format!("unknown query param: {k}")),
+        }
+    }
     match raw.as_deref() {
         None => Ok(ResumeMode::Continue),
         Some("continue") => Ok(ResumeMode::Continue),
@@ -939,10 +986,18 @@ fn handle_memory_search(process: &dyn Process, query: &str) -> Response<Body> {
                 None => return text(400, "all: expected true/false"),
             },
             "limit" => match v.parse::<usize>() {
-                Ok(n) => limit = n.clamp(1, 4096),
+                Ok(n) => {
+                    if n == 0 {
+                        return text(400, "limit: must be > 0");
+                    }
+                    if n > 4096 {
+                        return text(400, "limit: must be <= 4096");
+                    }
+                    limit = n;
+                }
                 Err(_) => return text(400, "limit: not a number"),
             },
-            _ => {}
+            _ => return text(400, &format!("unknown query param: {k}")),
         }
     }
     let Some(pat_str) = pattern_str else {
@@ -1022,10 +1077,12 @@ fn handle_halts_wait(process: &dyn Process, query: &str) -> Response<Body> {
                 Ok(s) => since = s,
                 Err(_) => return text(400, "since: not a number"),
             },
-            _ => {}
+            _ => return text(400, &format!("unknown query param: {k}")),
         }
     }
-    let timeout = timeout.min(MAX_LONG_POLL_TIMEOUT_MS);
+    if timeout > MAX_LONG_POLL_TIMEOUT_MS {
+        return text(400, &format!("timeout: must be <= {MAX_LONG_POLL_TIMEOUT_MS}"));
+    }
     match process.wait_halt(timeout, since) {
         Some(h) => text(200, &format_halt(&h)),
         None => text(204, ""),
@@ -1186,8 +1243,14 @@ fn handle_read(process: &dyn Process, query: &str) -> Response<Body> {
                 Some(a) => len = Some(a),
                 None => return text(400, "len: not a number"),
             },
-            "format" => raw = v == "raw",
-            _ => {}
+            "format" => match v.as_str() {
+                "hex" => raw = false,
+                "raw" => raw = true,
+                other => return text(400, &format!(
+                    "format: expected hex|raw, got `{other}`"
+                )),
+            },
+            _ => return text(400, &format!("unknown query param: {k}")),
         }
     }
     let (Some(addr), Some(len)) = (addr, len) else {
@@ -1216,11 +1279,12 @@ fn handle_read(process: &dyn Process, query: &str) -> Response<Body> {
 fn handle_write(process: &dyn Process, query: &str, req: &mut Request) -> Response<Body> {
     let mut addr: Option<usize> = None;
     for (k, v) in parse_query(query) {
-        if k == "addr" {
-            match parse_usize(&v) {
+        match k {
+            "addr" => match parse_usize(&v) {
                 Some(a) => addr = Some(a),
                 None => return text(400, "addr: not a number"),
-            }
+            },
+            _ => return text(400, &format!("unknown query param: {k}")),
         }
     }
     let Some(addr) = addr else {
@@ -1254,7 +1318,8 @@ fn handle_bp_set(process: &dyn Process, query: &str) -> Response<Body> {
     let mut one_shot: Option<bool> = None;
     let mut tid_filter: Option<u32> = None;
     let mut log_raw: Option<String> = None;
-    let mut cond_raw: Option<String> = None;
+    let mut log_if_raw: Option<String> = None;
+    let mut halt_if_raw: Option<String> = None;
     for (k, v) in parse_query(query) {
         match k {
             "addr" => match parse_usize(&v) {
@@ -1281,8 +1346,9 @@ fn handle_bp_set(process: &dyn Process, query: &str) -> Response<Body> {
                 Err(_) => return text(400, "tid: not a u32"),
             },
             "log" => log_raw = Some(v),
-            "cond" => cond_raw = Some(v),
-            _ => {}
+            "log_if" => log_if_raw = Some(v),
+            "halt_if" => halt_if_raw = Some(v),
+            _ => return text(400, &format!("unknown query param: {k}")),
         }
     }
     let (addr, requested_name) = match (addr, name) {
@@ -1351,14 +1417,21 @@ fn handle_bp_set(process: &dyn Process, query: &str) -> Response<Body> {
         },
         None => None,
     };
-    let cond = match cond_raw {
+    let log_cond = match log_if_raw {
         Some(s) => match dsl::parse_expr(&s) {
             Ok(expr) => Some(dsl::CondHook { source: s, expr }),
-            Err(e) => return text(400, &format!("cond: {e}")),
+            Err(e) => return text(400, &format!("log_if: {e}")),
         },
         None => None,
     };
-    let hooks = BpHooks { log, cond };
+    let halt_cond = match halt_if_raw {
+        Some(s) => match dsl::parse_expr(&s) {
+            Ok(expr) => Some(dsl::CondHook { source: s, expr }),
+            Err(e) => return text(400, &format!("halt_if: {e}")),
+        },
+        None => None,
+    };
+    let hooks = BpHooks { log, log_cond, halt_cond };
 
     match process.set_breakpoint(BpSpec { addr, kind, options, hooks, requested_name }) {
         // Echo the resolved address back so the user can sanity-check what
@@ -1377,7 +1450,13 @@ fn handle_bp_set(process: &dyn Process, query: &str) -> Response<Body> {
 }
 
 fn handle_symbol_resolve(process: &dyn Process, query: &str) -> Response<Body> {
-    let name = parse_query(query).find(|(k, _)| *k == "name").map(|(_, v)| v);
+    let mut name: Option<String> = None;
+    for (k, v) in parse_query(query) {
+        match k {
+            "name" => name = Some(v),
+            _ => return text(400, &format!("unknown query param: {k}")),
+        }
+    }
     let Some(name) = name else {
         return text(400, "missing name");
     };
@@ -1390,11 +1469,12 @@ fn handle_symbol_resolve(process: &dyn Process, query: &str) -> Response<Body> {
 fn handle_symbol_lookup(process: &dyn Process, query: &str) -> Response<Body> {
     let mut addr: Option<usize> = None;
     for (k, v) in parse_query(query) {
-        if k == "addr" {
-            match parse_usize(&v) {
+        match k {
+            "addr" => match parse_usize(&v) {
                 Some(a) => addr = Some(a),
                 None => return text(400, "addr: not a number"),
-            }
+            },
+            _ => return text(400, &format!("unknown query param: {k}")),
         }
     }
     let Some(addr) = addr else {
@@ -1423,11 +1503,12 @@ fn resolve_symbol(process: &dyn Process, name: &str) -> Result<usize, (u16, &'st
 fn handle_bp_clear(process: &dyn Process, query: &str) -> Response<Body> {
     let mut id: Option<u64> = None;
     for (k, v) in parse_query(query) {
-        if k == "id" {
-            match v.parse::<u64>() {
+        match k {
+            "id" => match v.parse::<u64>() {
                 Ok(n) => id = Some(n),
                 Err(_) => return text(400, "id: not a number"),
-            }
+            },
+            _ => return text(400, &format!("unknown query param: {k}")),
         }
     }
     let Some(id) = id else {
@@ -1469,8 +1550,11 @@ fn format_bp(bp: &BreakpointInfo) -> String {
     if let Some(log) = &bp.log {
         s.push_str(&format!(" log={}", quote_msg(log)));
     }
-    if let Some(cond) = &bp.cond {
-        s.push_str(&format!(" cond={}", quote_msg(cond)));
+    if let Some(c) = &bp.log_if {
+        s.push_str(&format!(" log_if={}", quote_msg(c)));
+    }
+    if let Some(c) = &bp.halt_if {
+        s.push_str(&format!(" halt_if={}", quote_msg(c)));
     }
     if let Some(req) = &bp.requested_name {
         s.push_str(&format!(" requested={}", quote_msg(req)));
@@ -1490,15 +1574,26 @@ fn handle_logs(query: &str) -> Response<Body> {
                 Err(_) => return text(400, "since: not a number"),
             },
             "limit" => match v.parse::<usize>() {
-                Ok(n) => limit = n.clamp(1, 4096),
+                Ok(n) => {
+                    if n == 0 {
+                        return text(400, "limit: must be > 0");
+                    }
+                    if n > 4096 {
+                        return text(400, "limit: must be <= 4096");
+                    }
+                    limit = n;
+                }
                 Err(_) => return text(400, "limit: not a number"),
             },
             "timeout" => match v.parse::<u64>() {
                 Ok(n) => timeout = n,
                 Err(_) => return text(400, "timeout: not a number"),
             },
-            _ => {}
+            _ => return text(400, &format!("unknown query param: {k}")),
         }
+    }
+    if timeout > MAX_LONG_POLL_TIMEOUT_MS {
+        return text(400, &format!("timeout: must be <= {MAX_LONG_POLL_TIMEOUT_MS}"));
     }
     let records = logs::poll(since, limit, timeout);
     let mut body = String::new();
@@ -1516,6 +1611,8 @@ fn handle_events(query: &str) -> Response<Body> {
     let mut since: u64 = 0;
     let mut limit: usize = 256;
     let mut timeout: u64 = 0;
+    let mut bp_id: Option<u64> = None;
+    let mut tail: Option<usize> = None;
     for (k, v) in parse_query(query) {
         match k {
             "since" => match v.parse::<u64>() {
@@ -1523,17 +1620,44 @@ fn handle_events(query: &str) -> Response<Body> {
                 Err(_) => return text(400, "since: not a number"),
             },
             "limit" => match v.parse::<usize>() {
-                Ok(n) => limit = n.clamp(1, 4096),
+                Ok(n) => {
+                    if n == 0 {
+                        return text(400, "limit: must be > 0");
+                    }
+                    if n > 4096 {
+                        return text(400, "limit: must be <= 4096");
+                    }
+                    limit = n;
+                }
                 Err(_) => return text(400, "limit: not a number"),
             },
             "timeout" => match v.parse::<u64>() {
                 Ok(n) => timeout = n,
                 Err(_) => return text(400, "timeout: not a number"),
             },
-            _ => {}
+            "bp_id" => match v.parse::<u64>() {
+                Ok(n) => bp_id = Some(n),
+                Err(_) => return text(400, "bp_id: not a number"),
+            },
+            "tail" => match v.parse::<usize>() {
+                Ok(n) => {
+                    if n == 0 {
+                        return text(400, "tail: must be > 0");
+                    }
+                    if n > 4096 {
+                        return text(400, "tail: must be <= 4096");
+                    }
+                    tail = Some(n);
+                }
+                Err(_) => return text(400, "tail: not a number"),
+            },
+            _ => return text(400, &format!("unknown query param: {k}")),
         }
     }
-    let evts = events::poll(since, limit, timeout);
+    if timeout > MAX_LONG_POLL_TIMEOUT_MS {
+        return text(400, &format!("timeout: must be <= {MAX_LONG_POLL_TIMEOUT_MS}"));
+    }
+    let evts = events::poll(since, limit, timeout, bp_id, tail);
     let mut body = String::new();
     for e in evts {
         let bp = match e.bp_id {
@@ -1619,10 +1743,44 @@ fn split_query(url: &str) -> (&str, &str) {
 }
 
 fn parse_query(q: &str) -> impl Iterator<Item = (&str, String)> {
+    // `validate_query` runs in `route` before any handler iterates this,
+    // so a malformed pair (no `=`) is a 400 at the dispatcher and we can
+    // safely `filter_map` here. If `parse_query` is ever called outside
+    // a route (e.g. a test), the worst outcome is silently dropping a
+    // bad pair — the validator is the load-bearing guard.
     q.split('&').filter(|s| !s.is_empty()).filter_map(|pair| {
         let (k, v) = pair.split_once('=')?;
         Some((k, percent_decode(v)))
     })
+}
+
+/// Reject queries with malformed pairs (missing `=`). Run at the
+/// dispatcher entry so per-handler `parse_query` loops can stay simple
+/// and so a typo like `?halt_if` (missing the `=expr`) surfaces as 400
+/// instead of being silently dropped.
+fn validate_query(q: &str) -> Result<(), String> {
+    for pair in q.split('&').filter(|s| !s.is_empty()) {
+        if pair.split_once('=').is_none() {
+            return Err(format!(
+                "malformed query pair (expected `key=value`): `{pair}`"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Wrap a handler that takes no query parameters. Returns 400 for any
+/// non-empty query so a typo on a no-arg endpoint (`/ping?foo=1`) can't
+/// silently succeed. `validate_query` has already verified the pair
+/// shape; here we only check that there are no pairs at all.
+fn noarg<F>(query: &str, handler: F) -> Response<Body>
+where
+    F: FnOnce() -> Response<Body>,
+{
+    if let Some((k, _)) = parse_query(query).next() {
+        return text(400, &format!("unknown query param: {k}"));
+    }
+    handler()
 }
 
 fn percent_decode(s: &str) -> String {
@@ -1766,7 +1924,16 @@ mod tests {
     #[test]
     fn parse_resume_mode_defaults_when_missing() {
         assert!(matches!(parse_resume_mode(""), Ok(ResumeMode::Continue)));
-        assert!(matches!(parse_resume_mode("foo=bar"), Ok(ResumeMode::Continue)));
+    }
+
+    #[test]
+    fn parse_resume_mode_rejects_unknown_param() {
+        // Strict-validation policy: unknown params are 400, not silently
+        // ignored — a typo like `?moed=step` (instead of `mode`) used to
+        // pass through and resume as Continue, masking the user's intent.
+        let err = parse_resume_mode("foo=bar").unwrap_err();
+        assert!(err.contains("unknown query param"), "{err}");
+        assert!(err.contains("foo"), "{err}");
     }
 
     #[test]
@@ -1781,6 +1948,24 @@ mod tests {
         let err = parse_resume_mode("mode=stp").unwrap_err();
         assert!(err.contains("stp"), "{err}");
         assert!(err.contains("continue|step|ret"), "{err}");
+    }
+
+    #[test]
+    fn validate_query_accepts_well_formed() {
+        assert!(validate_query("").is_ok());
+        assert!(validate_query("a=1").is_ok());
+        assert!(validate_query("a=1&b=2").is_ok());
+        assert!(validate_query("a=").is_ok()); // empty value is fine
+    }
+
+    #[test]
+    fn validate_query_rejects_missing_equals() {
+        let err = validate_query("foo").unwrap_err();
+        assert!(err.contains("malformed"), "{err}");
+        assert!(err.contains("foo"), "{err}");
+
+        let err = validate_query("a=1&bare").unwrap_err();
+        assert!(err.contains("bare"), "{err}");
     }
 }
 

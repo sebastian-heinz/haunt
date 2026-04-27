@@ -16,18 +16,18 @@ checksum = "6e4de3bc4ea267985becf712dc6d9eed8b04c953b3fcfb339ebc87acd9804901"
 
 [[package]]
 name = "haunt"
-version = "0.3.0"
+version = "0.4.0"
 
 [[package]]
 name = "haunt-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "tiny_http",
 ]
 
 [[package]]
 name = "haunt-inject"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "haunt-core",
  "windows-sys",
@@ -35,7 +35,7 @@ dependencies = [
 
 [[package]]
 name = "haunt-windows"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "haunt-core",
  "windows-sys",

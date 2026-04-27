@@ -257,7 +257,12 @@ fn reject_page_covering_sw_bp(
     let ps = page::page_size();
     let start = page::page_base(page_addr);
     let end = page_addr.checked_add(page_size).ok_or(BpError::Unsupported)?;
-    let end_page = end.saturating_add(ps - 1) & !(ps - 1);
+    // `checked_add` (not `saturating_add`) so a range that lands within
+    // `ps - 1` of `usize::MAX` rejects rather than wrapping `end_page`
+    // down past `end` and silently missing a SW BP on the last covered
+    // page. `page::install` uses `checked_add` for the same boundary;
+    // this kept it consistent.
+    let end_page = end.checked_add(ps - 1).ok_or(BpError::Unsupported)? & !(ps - 1);
     for e in reg.values() {
         if !matches!(e.state, KindState::Software(_)) {
             continue;
@@ -348,7 +353,8 @@ pub fn list() -> Vec<BreakpointInfo> {
             options: e.options,
             hits: e.hits,
             log: e.hooks.log_text().map(|s| s.to_string()),
-            cond: e.hooks.cond_text().map(|s| s.to_string()),
+            log_if: e.hooks.log_cond_text().map(|s| s.to_string()),
+            halt_if: e.hooks.halt_cond_text().map(|s| s.to_string()),
             requested_name: e.requested_name.clone(),
         })
         .collect()

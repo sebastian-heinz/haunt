@@ -70,7 +70,7 @@ Memory:
 Breakpoints:
   bp set <addr|module!symbol> [--kind sw|hw|page] [--no-halt]
          [--one-shot] [--access x|w|rw|any] [--size N] [--tid N]
-         [--log <template>] [--if <expr>]
+         [--log <template>] [--log-if <expr>] [--halt-if <expr>]
                              Install a BP. Returns `id=N addr=0x...`
                              (the resolved address, useful when name
                              lookup crossed a forwarder).
@@ -80,6 +80,19 @@ Breakpoints:
                                           for high-rate tracing)
                              --one-shot   remove the BP after one hit
                              --tid N      only fire on that OS thread
+                             --log-if X   gate log+event emission on X.
+                                          When X is zero, the BP fires
+                                          (hits++ counts) but no log
+                                          line and no event record.
+                                          Halt is independent.
+                             --halt-if X  gate halting on X. When X is
+                                          zero, the BP does not park
+                                          the firing thread even when
+                                          --halt is the default. Log
+                                          and event emission are
+                                          independent. Lets you log
+                                          everything but halt only on
+                                          a specific condition.
                              HW: --access controls trigger condition
                                  (`x|exec` `w|write` `rw|readwrite`
                                  `any`); --size in {1,2,4,8} (8 is x64-
@@ -103,8 +116,10 @@ Breakpoints:
     %[expr]    deref expr, substitute pointed-to value
     %{expr}    raw expression value
     %%         literal %
-  --if takes the same expression syntax; non-zero passes the gate
-  (no halt, no log, no event when it fails).
+  --log-if and --halt-if take the same expression syntax; non-zero
+  passes the gate. Gates are independent: --log-if controls log+event
+  emission, --halt-if controls halt only. hits++ counts every fire
+  regardless of either gate (it's the raw fire count).
   Operators: + - * & | ^ << >> ~ == != < <= > >= ()
   over hex/decimal literals, register names, [deref] subexpressions.
   Parser depth capped at 32 levels.
@@ -154,15 +169,39 @@ Halts (parked threads):
 
 Trace events (from `--log` BPs):
   events [--since <id>] [--limit N] [--timeout <ms>]
-                             tail the 4096-record ring buffer; oldest
-                             record is evicted on overflow. Long-polls
-                             up to timeout (agent caps at 60000 ms).
-                             Each record: id, bp_id, tid, rip, t (ms
-                             since first event), msg (the rendered
-                             template).
+         [--bp-id N] [--tail N] [--no-annotate]
+                             4096-record ring buffer; oldest record is
+                             evicted on overflow. Each record: id,
+                             bp_id, tid, rip, t (ms since first event),
+                             msg (the rendered template).
+                             --since X    return records with id > X,
+                                          long-poll up to --timeout
+                                          (agent caps at 60000 ms).
+                                          With high hit rates, keep
+                                          the last id you saw and pass
+                                          it back as --since on the
+                                          next call.
+                             --tail N     return the most recent N
+                                          matching records in
+                                          chronological order — the
+                                          right tool for `I just set
+                                          the BP, what fired so far?`.
+                                          Disables long-poll (snapshot
+                                          of what's in the ring now).
+                                          --since is ignored when
+                                          --tail is set.
+                             --bp-id N    server-side filter: only
+                                          records from BP N. Useful
+                                          when several BPs fire at
+                                          high rate.
+                             --no-annotate
+                                          disable address-to-module
+                                          annotation in the output
+                                          (default-on; turn off for
+                                          stable parsing in scripts).
 
 Agent logs:
-  logs [--since <id>] [--limit N] [--timeout <ms>]
+  logs [--since <id>] [--limit N] [--timeout <ms>] [--no-annotate]
                              tail the agent's own info/warn/error
                              output (the messages haunt.dll itself
                              emits — bind status, BP install reports,
@@ -246,6 +285,137 @@ fn print_ok(body: Vec<u8>) {
     if body.last().copied() != Some(b'\n') {
         println!();
     }
+}
+
+/// Print the body annotated with `(module+0xoffset)` after every hex
+/// address that falls inside a loaded module. Used by `events` and
+/// `logs` so users don't have to chase up every `0x556ba058` with a
+/// separate `addr` lookup. Annotation is opt-out via `--no-annotate`
+/// because scripts parsing the output need stable formatting.
+fn print_ok_annotated(body: Vec<u8>, modules: &[Module]) {
+    let body_str = match std::str::from_utf8(&body) {
+        Ok(s) => s,
+        Err(_) => {
+            // Non-UTF-8 — fall back to raw output rather than mangle bytes.
+            std::io::stdout().write_all(&body).ok();
+            if body.last().copied() != Some(b'\n') {
+                println!();
+            }
+            return;
+        }
+    };
+    let annotated = annotate_addresses(body_str, modules);
+    std::io::stdout().write_all(annotated.as_bytes()).ok();
+    if !annotated.ends_with('\n') {
+        println!();
+    }
+}
+
+#[derive(Debug, Clone)]
+struct Module {
+    name: String,
+    base: usize,
+    size: usize,
+}
+
+/// Best-effort `/modules` fetch. Returns an empty vec on any failure
+/// (auth/transport/parse) so callers degrade to no-annotation rather
+/// than aborting. Cached per-CLI-invocation by the caller; modules
+/// don't change often inside a single command's lifetime.
+fn fetch_modules() -> Vec<Module> {
+    match get("/modules") {
+        Ok(body) => parse_modules(&body),
+        Err(_) => Vec::new(),
+    }
+}
+
+fn parse_modules(body: &[u8]) -> Vec<Module> {
+    let s = match std::str::from_utf8(body) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    for line in s.lines() {
+        let mut name: Option<String> = None;
+        let mut base: Option<usize> = None;
+        let mut size: Option<usize> = None;
+        for kv in line.split_whitespace() {
+            let (k, v) = match kv.split_once('=') {
+                Some(p) => p,
+                None => continue,
+            };
+            match k {
+                "name" => name = Some(v.to_string()),
+                "base" => base = parse_usize(v),
+                "size" => size = v.parse().ok(),
+                _ => {}
+            }
+        }
+        if let (Some(n), Some(b), Some(z)) = (name, base, size) {
+            // Defensive: skip zero-size or wrap-around modules so the
+            // "addr ∈ [base, base+size)" check below can't false-match
+            // every address in the AS.
+            if z > 0 && b.checked_add(z).is_some() {
+                out.push(Module { name: n, base: b, size: z });
+            }
+        }
+    }
+    out
+}
+
+/// Scan `text` byte-by-byte for `0x[0-9a-fA-F]+` sequences; for each
+/// that resolves to an address inside a loaded module, append
+/// ` (module+0xoffset)`. Hex sequences shorter than 4 digits are
+/// skipped — they're almost always literal small numbers, not
+/// addresses. Larger ones outside any module are also skipped.
+fn annotate_addresses(text: &str, modules: &[Module]) -> String {
+    if modules.is_empty() {
+        return text.to_string();
+    }
+    let bytes = text.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len() + 64);
+    let mut i = 0;
+    while i < bytes.len() {
+        let is_hex_prefix = i + 2 < bytes.len()
+            && bytes[i] == b'0'
+            && (bytes[i + 1] == b'x' || bytes[i + 1] == b'X')
+            && bytes[i + 2].is_ascii_hexdigit();
+        if is_hex_prefix {
+            let start = i + 2;
+            let mut j = start;
+            while j < bytes.len() && bytes[j].is_ascii_hexdigit() {
+                j += 1;
+            }
+            out.extend_from_slice(&bytes[i..j]);
+            let hex_len = j - start;
+            // 4 digit lower bound: skips small literal hex (e.g. flags
+            // like `0x100`). 16 digit upper bound: matches max usize on
+            // x64; any longer is malformed.
+            if (4..=16).contains(&hex_len) {
+                if let Ok(addr_str) = std::str::from_utf8(&bytes[start..j]) {
+                    if let Ok(v) = usize::from_str_radix(addr_str, 16) {
+                        if let Some(m) = lookup_module(modules, v) {
+                            let suffix = format!(" ({}+0x{:x})", m.name, v - m.base);
+                            out.extend_from_slice(suffix.as_bytes());
+                        }
+                    }
+                }
+            }
+            i = j;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).unwrap_or_else(|e| {
+        String::from_utf8_lossy(&e.into_bytes()).into_owned()
+    })
+}
+
+fn lookup_module(modules: &[Module], addr: usize) -> Option<&Module> {
+    modules.iter().find(|m| {
+        addr >= m.base && m.base.checked_add(m.size).map_or(false, |end| addr < end)
+    })
 }
 
 fn cmd_read(args: &[String], raw: bool) -> Result<(), String> {
@@ -360,10 +530,15 @@ fn cmd_bp(args: &[String]) -> Result<(), String> {
                         let v = rest.get(i).ok_or("--log value")?;
                         query.push_str(&format!("&log={}", url_encode(v)));
                     }
-                    "--if" => {
+                    "--log-if" => {
                         i += 1;
-                        let v = rest.get(i).ok_or("--if value")?;
-                        query.push_str(&format!("&cond={}", url_encode(v)));
+                        let v = rest.get(i).ok_or("--log-if value")?;
+                        query.push_str(&format!("&log_if={}", url_encode(v)));
+                    }
+                    "--halt-if" => {
+                        i += 1;
+                        let v = rest.get(i).ok_or("--halt-if value")?;
+                        query.push_str(&format!("&halt_if={}", url_encode(v)));
                     }
                     other => return Err(format!("unknown flag: {other}")),
                 }
@@ -638,6 +813,9 @@ fn cmd_events(args: &[String]) -> Result<(), String> {
     let mut since: u64 = 0;
     let mut limit: u64 = 256;
     let mut timeout: u64 = 0;
+    let mut bp_id: Option<u64> = None;
+    let mut tail: Option<u64> = None;
+    let mut annotate = true;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -653,16 +831,43 @@ fn cmd_events(args: &[String]) -> Result<(), String> {
                 timeout = args.get(i + 1).ok_or("--timeout value")?.parse().map_err(|_| "bad timeout")?;
                 i += 2;
             }
+            "--bp-id" => {
+                bp_id = Some(args.get(i + 1).ok_or("--bp-id value")?.parse().map_err(|_| "bad bp-id")?);
+                i += 2;
+            }
+            "--tail" => {
+                tail = Some(args.get(i + 1).ok_or("--tail value")?.parse().map_err(|_| "bad tail")?);
+                i += 2;
+            }
+            "--no-annotate" => {
+                annotate = false;
+                i += 1;
+            }
             other => return Err(format!("unknown flag: {other}")),
         }
     }
-    get(&format!("/events?since={since}&limit={limit}&timeout={timeout}")).map(print_ok)
+    let mut path = format!("/events?since={since}&limit={limit}&timeout={timeout}");
+    if let Some(b) = bp_id {
+        path.push_str(&format!("&bp_id={b}"));
+    }
+    if let Some(n) = tail {
+        path.push_str(&format!("&tail={n}"));
+    }
+    let body = get(&path)?;
+    if annotate {
+        let modules = fetch_modules();
+        print_ok_annotated(body, &modules);
+    } else {
+        print_ok(body);
+    }
+    Ok(())
 }
 
 fn cmd_logs(args: &[String]) -> Result<(), String> {
     let mut since: u64 = 0;
     let mut limit: u64 = 256;
     let mut timeout: u64 = 0;
+    let mut annotate = true;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -678,10 +883,21 @@ fn cmd_logs(args: &[String]) -> Result<(), String> {
                 timeout = args.get(i + 1).ok_or("--timeout value")?.parse().map_err(|_| "bad timeout")?;
                 i += 2;
             }
+            "--no-annotate" => {
+                annotate = false;
+                i += 1;
+            }
             other => return Err(format!("unknown flag: {other}")),
         }
     }
-    get(&format!("/logs?since={since}&limit={limit}&timeout={timeout}")).map(print_ok)
+    let body = get(&format!("/logs?since={since}&limit={limit}&timeout={timeout}"))?;
+    if annotate {
+        let modules = fetch_modules();
+        print_ok_annotated(body, &modules);
+    } else {
+        print_ok(body);
+    }
+    Ok(())
 }
 
 fn cmd_resume(args: &[String]) -> Result<(), String> {

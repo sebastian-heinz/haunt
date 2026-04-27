@@ -7,7 +7,94 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-## [0.3.0] - 2026-04-27
+## [0.4.0] - 2026-04-27
+
+### Changed (breaking)
+- **Strict-validation tightening across the HTTP surface.** Per the
+  threat-model note added to AGENTS.md (we share an address space with
+  the host; auth is not load-bearing, *correctness* is), every silent
+  acceptance path is now a `400`:
+  - **Unknown query parameters are rejected** by every endpoint that
+    iterates query (e.g. `/bp/set?halft_if=...` — typo of `halt_if` —
+    used to silently set a BP with no halt gate; now 400 names the
+    offending key). `parse_resume_mode("foo=bar")` now errors instead
+    of defaulting to `Continue`.
+  - **No-arg endpoints reject any query.** `/ping?foo=1`, `/info?x=y`,
+    `/modules?stale=1`, `/halts?...`, `/threads?...`, `/memory/regions?...`,
+    `/bp/list?...`, `/shutdown?...`, `/bp/<id>?...`, and
+    `/modules/<name>/exports?...` all 400 when given any params.
+  - **Malformed query pairs are rejected at the dispatcher.** `?foo`
+    (missing `=`) used to be silently dropped by `parse_query`; now
+    `route()` 400s with `malformed query pair (expected key=value):
+    \`foo\``. Single source of truth — handlers don't have to recheck.
+  - **No more silent `clamp` on user-supplied counts.** `events`/`logs`
+    `?limit=0` was silently raised to 1; `?limit=99999` was silently
+    capped to 4096; `events` `?tail=0` was silently raised to 1; same
+    for `tail` upper bound. All four cases now 400 with a message that
+    names the parameter and the legal range. `/halts/<id>/stack?depth=0`
+    likewise. `/halts/wait?timeout=...` and `/events`/`logs?timeout=...`
+    over `MAX_LONG_POLL_TIMEOUT_MS` (60 s) now 400 instead of being
+    clamped (the platform layer still re-clamps defensively in case a
+    direct caller bypasses the HTTP edge).
+  - **`/memory/read?format=` rejects unknown values.** Previously
+    anything other than `raw` was silently treated as `hex`; now
+    `format=hax` 400s rather than yielding hex output.
+
+### Fixed
+- **`resume --ret` now logs SW-BP install failure.** The one-shot SW
+  BP planted at `[xSP]` was installed via `let _ = super::set(...)`
+  — any `Conflict`/`Unwritable`/etc. error was silently dropped and
+  the user got `200 resumed` while the thread ran free past the
+  function with no halt. Now `warn!`s with the failure reason, visible
+  via `haunt logs`.
+- **`reject_page_covering_sw_bp` overflow.** The neighbouring
+  `page_addr.checked_add(page_size)` correctly rejected wrap, but
+  `end.saturating_add(ps - 1) & !(ps - 1)` could wrap `end_page` down
+  past `end` and silently miss a SW BP on the last covered page. Now
+  uses `checked_add` symmetrically with `page::install`.
+- **`dsl::render` no longer `unwrap`s `write!` to a `String`.** The
+  unwrap was infallible in practice (`fmt::Write for String` never
+  errors) but violated the no-`unwrap` policy; a future refactor that
+  swapped the sink for something fallible would have turned a render
+  bug into a host-process abort. Now uses `let _ = write!(...)`.
+
+### Docs
+- **AGENTS.md threat model section.** Codifies that haunt's threat
+  model is the host process (not network attackers): we share the
+  address space, every silent default is a host bug, every panic kills
+  the host. Strict validation, panic-free hot paths, no `unwrap`, no
+  `unwrap_or` on user input, no silent defaults — non-negotiable.
+
+### Added
+- **`events --tail N`** returns the most recent `N` matching records
+  in chronological order, regardless of `--since`. Disables long-poll
+  (a snapshot, not a wait). Solves the ring-overflow foot-shape where
+  `--since=0` slid off the front of the deque while the caller was
+  setting up. Server: `?tail=N` query param; long-poll suppressed when
+  set.
+- **`events --bp-id N`** server-side filter — only records from BP
+  `N` come back, useful when several BPs fire at high rate and the
+  client only cares about one. Server: `?bp_id=N` query param.
+- **CLI-side address annotation in `haunt events` / `haunt logs`.**
+  Hex sequences in record `msg` fields that fall inside a loaded
+  module are annotated inline as `0x... (module+0xoffset)` against
+  `/modules`. Default-on; `--no-annotate` for stable output in
+  scripts. Done CLI-side rather than VEH-side because module
+  enumeration takes the loader lock — calling it from the VEH (where
+  `--log` records are emitted) is a deadlock vector we deliberately
+  avoid for the same reason `resume --ret` was moved off
+  `modules::list` to `VirtualQuery`.
+
+### Changed
+- **`--if` split into `--log-if` and `--halt-if`.** The original
+  single `cond` gate covered halt + log + event uniformly. Splitting
+  lets a single BP log every call but halt only on a specific
+  predicate (e.g. `--log "..." --halt-if "[ecx] == 0x..."`). Per the
+  AGENTS.md no-compat policy, `--if` is removed; HTTP `?cond=` is
+  removed in favour of `?log_if=` and `?halt_if=`. `bp list` /
+  `bp info` output now has `log_if=...` and `halt_if=...` fields in
+  place of `cond=...`. `entry.hits` continues to count every fire
+  regardless of either gate.
 
 ### Added
 - **`GET /logs` endpoint and `haunt logs` CLI** for tailing the agent's
