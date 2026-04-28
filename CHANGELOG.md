@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-04-28
+
+Release-engineering only. No behavioural changes to the agent, CLI,
+or HTTP protocol — `haunt-core`, `haunt-windows`, `haunt-inject`,
+and `haunt` are byte-for-byte equivalent to v0.5.1 when built from
+the same toolchain.
+
+### Changed
+- **Renamed CLI release artifacts to match the project's existing
+  local naming.** v0.5.1's `haunt-{linux,macos}-x64` are now
+  `haunt-{linux,macos}-x86_64`, aligning with the Rust target-triple
+  convention already used in the local `dist/` directory and removing
+  drift between the GitHub release page and any scripts pointing at
+  local builds.
+- **macOS builds collapsed to a single `cli-macos` job.** The two
+  per-arch matrix entries (`macos-13` for Intel, `macos-14` for Apple
+  Silicon) are now one job on `macos-14` that cross-compiles
+  `x86_64-apple-darwin` from the arm64 host. Apple's clang ships both
+  SDKs so this is a native cross — same toolchain, same binary. This
+  eliminates the `macos-13` runner-queue dependency that left v0.5.1
+  stuck for ~25 min waiting on a runner allocation that never landed.
+
+### Added
+- **`haunt-macos-universal`** — `lipo`-merged fat binary that runs on
+  either macOS arch. For distribution scripts that don't want to
+  branch on architecture, or for users who don't know which Mac their
+  end-recipient runs.
+
+### Removed
+- **Per-asset `*.sha256` sidecars** for the Linux + macOS CLI
+  binaries that v0.5.1 added. The Windows job's consolidated
+  `SHA256SUMS` was already the only checksum file in the local
+  `dist/` convention; the asymmetry of "Windows binaries get a
+  combined sums file, every other binary gets its own sidecar"
+  was confusing without buying anything verifiable that
+  `shasum -a 256 <file>` from the user's own host doesn't already
+  give them.
+
 ## [0.5.1] - 2026-04-28
 
 ### Added
