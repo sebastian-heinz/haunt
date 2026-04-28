@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-04-28
+
+### Changed
+- **Trace + log ring capacity raised from 4 096 to 40 960 records.**
+  At 4 096 a short burst from a high-rate `--log` BP could slide
+  records off the front of the ring before a `/events` caller
+  finished its setup round trip. The new bound matches the new
+  `limit`/`tail` ceiling so a single call can drain the whole ring.
+- **`MAX_LONG_POLL_TIMEOUT_MS` raised from 60 000 to 300 000 ms (5 min).**
+  Operators tailing `/events` or `/logs` over a slow link no longer
+  have to re-poll every minute. Both the HTTP-edge validator and the
+  platform-side `wait_halt` / `events::poll` / `logs::poll` impls
+  enforce the new ceiling.
+- **CLI socket read timeout raised from 90 s to 310 s.** Previous
+  value pre-dated the long-poll cap bump; `--timeout` values above
+  ~90 s would have the CLI's `TcpStream` abort the read before the
+  agent could respond. New value covers the 300 s agent ceiling
+  plus loopback slack.
+
+### Added
+- **`MAX_TRACE_BATCH` shared constant** as the single source of truth
+  for both the events / logs ring capacity and the HTTP-edge `limit`
+  / `tail` validator. The previous duplicated `4096` literal in
+  `handle_events` / `handle_logs` would silently cap clients to the
+  old value if the ring grew without the validator being touched.
+
+### Documentation
+- README's `Concurrency` paragraph now lists `/logs` alongside
+  `/halts/wait` and `/events` as endpoints sharing the 64-of-80
+  long-poll sub-cap (the classifier already routed `/logs` there;
+  the prose was stale).
+- CLI `USAGE` for `events` and `logs` now spells out the `--limit`
+  default (256) and max (40960 = ring size); previously users only
+  learned the bound from a 400 response.
+
 ## [0.4.0] - 2026-04-27
 
 ### Changed (breaking)
