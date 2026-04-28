@@ -56,6 +56,19 @@ Only `haunt-windows` and `haunt-inject` are relevant; the CLI is
 bitness-agnostic. CI publishes 32-bit artifacts as `haunt-x86.dll`
 and `haunt-inject-x86.exe`.
 
+The `haunt` CLI is platform-agnostic (loopback HTTP over `std::net`,
+no `unsafe`, no native deps), so each release also ships native
+builds for non-Windows hosts:
+
+- `haunt-linux-x64`, `haunt-linux-arm64` — musl-static, run on any
+  Linux distro from kernel 2.6+ with no glibc/shared-lib deps.
+- `haunt-macos-x64`, `haunt-macos-arm64` — native Apple Silicon and
+  Intel builds.
+
+Each ships with a sibling `*.sha256` next to it on the release page.
+Drive a Windows-target agent from any of these by setting
+`HAUNT_URL` to the loopback-forwarded port (see "Remote" below).
+
 ## Quick start
 
 ```sh

@@ -7,7 +7,8 @@ on:
   workflow_dispatch:
 
 jobs:
-  build:
+  windows:
+    name: windows (DLL + injector + CLI, x64 + x86)
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -61,5 +62,89 @@ jobs:
         if: github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@v4
         with:
-          name: haunt-${{ github.sha }}
+          name: windows-${{ github.sha }}
           path: dist/
+
+  cli:
+    # Builds the haunt CLI for non-Windows hosts. The DLL and injector
+    # are Windows-only by definition (live in the target's address
+    # space, use Win32 directly), so only the CLI is matrix-built here.
+    #
+    # Linux uses musl static linking so a single binary runs on any
+    # distro from kernel 2.6+ — no glibc version dance, no shared-lib
+    # surprises on minimal containers, no if/else for old vs new
+    # systems. The CLI talks loopback HTTP and uses only `std`, so
+    # there's no OpenSSL / native-tls dep to drag in.
+    #
+    # macOS uses native runners (one per arch). Cross-compiling
+    # x64→arm64 macOS would need the SDK shipped separately;
+    # native runners are simpler and the matrix cost is two extra
+    # short jobs.
+    name: cli-${{ matrix.asset }}
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+            asset: haunt-linux-x64
+            install: sudo apt-get update && sudo apt-get install -y musl-tools
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-22.04-arm
+            asset: haunt-linux-arm64
+            install: sudo apt-get update && sudo apt-get install -y musl-tools
+          - target: x86_64-apple-darwin
+            runner: macos-13
+            asset: haunt-macos-x64
+            install: ":"
+          - target: aarch64-apple-darwin
+            runner: macos-14
+            asset: haunt-macos-arm64
+            install: ":"
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build deps
+        run: ${{ matrix.install }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build CLI
+        run: cargo build --release --target ${{ matrix.target }} -p haunt
+
+      - name: Stage artifact
+        # Use shasum (present on macOS + Linux) rather than sha256sum
+        # (Linux-only). Output format matches `sha256sum` so a single
+        # `sha256sum -c` from any platform validates either checksum.
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/haunt dist/${{ matrix.asset }}
+          (cd dist && shasum -a 256 ${{ matrix.asset }} > ${{ matrix.asset }}.sha256)
+          ls -la dist/
+
+      - name: Attach to GitHub release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/${{ matrix.asset }}
+            dist/${{ matrix.asset }}.sha256
+          fail_on_unmatched_files: true
+
+      - name: Upload workflow artifact
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}*
