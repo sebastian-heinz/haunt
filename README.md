@@ -119,7 +119,7 @@ from `/info`).
 scope is required (`--module`, `--start/--end`, or `--all`):
 
 ```sh
-haunt search "48 89 ?? ?? c3" --module CryGame.dll --limit 16
+haunt search "48 89 ?? ?? c3" --module GameLibrary.dll --limit 16
 ```
 
 `--all` opts into a whole-AS scan — slow on multi-GB targets, no
@@ -129,7 +129,12 @@ progress, no cancel.
 resume. `setregs` merges into the parked thread's saved CONTEXT —
 registers you don't name keep their captured values. Either x64 (`rax`)
 or x86 (`eax`) names work; unknown names return `400` instead of being
-silently dropped.
+silently dropped. `eflags` is rejected outright (it carries
+VEH-managed bits — TF for BP rearm, RF for HW-BP resume — that the
+agent rewrites on every halt; editing it would silently disable BPs
+or kill the host). On x86 agents, `r8`–`r15` and any value > `u32::MAX`
+are also rejected — the merge would silently no-op or truncate, and
+the natural footgun is piping an x64 regs dump into an x86 setregs.
 
 ```sh
 haunt bp set 0x7FF601234ABC --kind sw --one-shot
@@ -164,7 +169,7 @@ only on the runs that match a condition.
 
 ```sh
 # Log ecx and *(ecx+8) on every call to a 200/sec hot function:
-haunt bp set CryGame.dll!OnPacket --no-halt \
+haunt bp set GameLibrary.dll!OnPacket --no-halt \
   --log "ecx=%ecx [ecx+8]=%[ecx+8]"
 
 # Halt only when a specific value flows through (no --log gate, so
@@ -172,7 +177,7 @@ haunt bp set CryGame.dll!OnPacket --no-halt \
 haunt bp set 0x7FF601234ABC --halt-if "ecx == 0x281"
 
 # Log every call, halt only on a specific run:
-haunt bp set CryGame.dll!OnPacket \
+haunt bp set GameLibrary.dll!OnPacket \
   --log "type=%ecx [esp+4]=%[esp+4]" \
   --halt-if "[ecx] == 0x11D1F298"
 
@@ -188,8 +193,11 @@ Template syntax: `%name` = register, `%[expr]` = deref + value,
 `+ - * & | ^ << >> ~ == != < <= > >= ()` over hex/decimal literals,
 register names, and `[deref]` subexpressions. Both gate predicates
 take the same syntax; non-zero passes. Parser depth is capped at 32
-levels. `entry.hits` increments on every fire regardless of either
-gate (raw fire count).
+levels. Shift amounts ≥ 64 (or any value not fitting in `u32`) yield
+`?` in the rendered template and a failed gate — `wrapping_shl`'s
+silent mod-64 behaviour is rejected per the strict-validation policy.
+`entry.hits` increments on every fire regardless of either gate (raw
+fire count).
 
 `haunt events` and `haunt logs` annotate hex addresses inline as
 `(module+0xoffset)` against `/modules`; pass `--no-annotate` for
@@ -205,6 +213,62 @@ sleep 5
 haunt events --since 0 --limit 40960 > writers.log
 haunt bp clear <id>
 ```
+
+**Sessions.** Snapshot the agent's current schemas + BPs to a single
+JSON file, replay onto a fresh agent.
+
+```sh
+haunt session save snap.session     # captures structs + BPs (no halts/logs)
+# ... re-inject the DLL ...
+haunt session restore snap.session  # replays through the existing endpoints
+```
+
+Lossy on schema comments (the resolved registry doesn't keep them),
+lossless on layout. Symbol-named BPs (`module!symbol`) re-resolve at
+restore so re-injection at a different load address still hits the
+right code. The session is *spec*, not state — hit counts, halts, and
+log/event records are not captured (logs are dumped via `haunt events`
+when you actually need them).
+
+**Layout schemas (`*.layouts`).** Hand-writeable struct definitions
+for the structures you're reading at hit time. The agent holds a flat
+registry of structs by name — files are pure upload conduits, no
+schema-name layer.
+
+```text
+struct GamePlayer size=0x54 {
+    ptr32         vtable        @0x00
+    ptr32         m_pGameObject @0x44
+    ptr32<GameActor> m_pActor      @0x48
+    u32           m_entityId    @0x4C
+    u32           m_pad         @0x50
+}
+```
+
+Types: `u8`/`u16`/`u32`/`u64`, `i8`–`i64`, `f32`/`f64`, `bool8`/`bool32`,
+`ptr32`/`ptr64` with optional `<T>` for typed pointers, `cstr[N]`,
+`bytes[N]`. Field-level `name[N]` is an array. Every field requires
+an explicit `@offset`; gaps are allowed. Total field footprint
+(`element_size × array_count`) is capped at 64 KiB — caps hit-time
+render allocation and blocks typo-bombs like `bytes[1000000000]` or
+`u32 arr[1000000]` that would allocate hundreds of MB on every BP
+hit. Genuine multi-MB blobs should split into smaller fields.
+
+```sh
+haunt schema check game.layouts            # local validate only
+haunt schema load game.layouts             # upload; 409 on name collision
+haunt schema load game.layouts --replace   # overwrite collisions atomically
+haunt schema list                          # name-sorted, with size + field count
+haunt schema show GameEnemy         # one struct, all fields with @offset
+haunt schema drop GameEnemy         # remove one
+haunt schema clear                         # wipe the registry
+```
+
+Validation rejects size mismatches, overlap, unsorted offsets,
+duplicate names, zero-length arrays, and over-cap total field
+sizes — each error is rendered with carets and source context
+(color when stderr is a terminal). The agent re-validates on
+every upload, regardless of what the CLI already checked.
 
 ## Halts and global locks
 
@@ -305,7 +369,7 @@ Memory:
 - `GET  /memory/read?addr=0x...&len=N[&format=hex|raw]` — partial reads return `206` with the readable prefix
 - `POST /memory/write?addr=0x...` (raw body)
 - `GET  /memory/regions`
-- `GET  /memory/search?pattern=<hex>{&module=<name>|&start=0x...&end=0x...|&all=true}[&limit=N]` — IDA-style hex; `??` = wildcard. Scope required.
+- `GET  /memory/search?pattern=<hex>{&module=<name>|&start=0x...&end=0x...|&all=true}[&limit=N]` — IDA-style hex; `??` = wildcard. Scope required. `limit` default 256, max 4096 (above is 400; narrow scope rather than raising the cap).
 
 Breakpoints:
 - `POST /bp/set?{addr=0x...|name=module!symbol}&kind=sw|hw|page[&access=x|w|rw|any][&size=N][&halt=true|false][&one_shot=true][&tid=N][&log=<template>][&log_if=<expr>][&halt_if=<expr>]`
@@ -341,19 +405,19 @@ Halts:
 - `GET  /halts/wait?timeout=<ms>&since=<hit_id>` — oldest hit with `id > since`; `timeout` ≤ 300 000 ms (above is 400)
 - `GET  /halts/<hit_id>` — register dump; values pointing into a loaded module are auto-annotated as `module+0xoffset`
 - `GET  /halts/<hit_id>/stack[?depth=N]` — backtrace; default 32; `depth` must be in `[1, 256]`
-- `POST /halts/<hit_id>/regs` (body: `name=value` lines)
+- `POST /halts/<hit_id>/regs` (body: `name=value` lines; partial patch — registers you don't name keep their captured values; `eflags` rejected; on x86 agents `r8`–`r15` and values > `u32::MAX` rejected)
 - `POST /halts/<hit_id>/resume?mode=continue|step|ret`
 
 Introspection:
 - `GET  /modules`
 - `GET  /modules/<name>/exports` — forwarded entries appear as `name=Foo forward=other.dll.RealName`
-- `GET  /threads` — per-thread DR state, `accessible`, `agent` flag, `attach_ok`/`attach_fail` counters
+- `GET  /threads` — per-thread DR state, `accessible`, `agent` flag, `attach_ok`/`attach_fail` counters (`attach_ok` only counts threads where a post-`SetThreadContext` readback confirmed DR0–3/DR7 actually persisted; Wine and some AC shims silently drop debug-register writes)
 - `GET  /symbols/resolve?name=module!symbol` (uses `GetProcAddress` so forwards follow)
 - `GET  /symbols/lookup?addr=0x...` — address → `module+0xoffset`
 
 Misc:
 - `GET  /ping` `GET /version` `POST /shutdown`
-- `GET  /info` — `version=...\narch=x86_64|x86\npid=...\nuptime_ms=...`
+- `GET  /info` — `version=...\narch=x86_64|x86\npid=...\nuptime_ms=...\nevents_dropped_reentry=N\nevents_dropped_overflow=N\nlogs_dropped_reentry=N\nlogs_dropped_overflow=N`. The `*_dropped_*` counters surface silent record losses on the `/events` and `/logs` rings: `reentry` increments when a `--log` BP fires inside a function the trace path itself calls (the re-entry guard would otherwise deadlock); `overflow` increments when a new push evicts an old record because the consumer fell behind.
 
 ## License
 

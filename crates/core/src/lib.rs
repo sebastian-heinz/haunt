@@ -7,6 +7,7 @@ pub mod dsl;
 pub mod events;
 pub mod log;
 pub mod logs;
+pub mod schema;
 pub mod thread_role;
 
 // MinGW i686 + panic=abort still references `_Unwind_Resume` from stdlib's
@@ -56,6 +57,19 @@ pub const MAX_LONG_POLL_TIMEOUT_MS: u64 = 300_000;
 /// ring size in one constant prevents drift — bumping the ring without
 /// bumping the bound would silently cap clients to the old value.
 pub const MAX_TRACE_BATCH: usize = 40_960;
+
+/// Hard cap on `limit` for `/memory/search`. Smaller than the trace
+/// ring on purpose: every search hit is a usize, so a single call
+/// returning many thousands of addresses would still be cheap on the
+/// wire, but the search itself is `O(scope_size * pattern_len)`
+/// against committed memory and a runaway `--all --limit` is the
+/// obvious way to wedge an agent worker. 4096 covers any realistic
+/// reverse-engineering use (a single signature hits a handful of
+/// times in any one module); bigger asks should narrow scope, not
+/// raise the limit. Named constant rather than a literal so the
+/// HTTP-edge validator and any future client / docs share one source
+/// of truth — same drift-avoidance reasoning as `MAX_TRACE_BATCH`.
+pub const MAX_SEARCH_LIMIT: usize = 4096;
 
 /// Hard cap on total concurrent worker threads. Each request runs on its
 /// own worker (~1 MB stack VM on Windows x64); the long-poll endpoints
@@ -215,11 +229,19 @@ pub struct BpHooks {
     pub log: Option<dsl::TemplateHook>,
     pub log_cond: Option<dsl::CondHook>,
     pub halt_cond: Option<dsl::CondHook>,
+    /// Per-BP struct bindings. Each entry is `name=Type@expr`; `expr` is
+    /// evaluated each hit to get a base address, `Type` is looked up in
+    /// the schema registry for field offsets. Consumed by upcoming
+    /// `%[name.field]` template support.
+    pub struct_bindings: Vec<dsl::StructBinding>,
 }
 
 impl BpHooks {
     pub fn is_empty(&self) -> bool {
-        self.log.is_none() && self.log_cond.is_none() && self.halt_cond.is_none()
+        self.log.is_none()
+            && self.log_cond.is_none()
+            && self.halt_cond.is_none()
+            && self.struct_bindings.is_empty()
     }
 
     pub fn log_text(&self) -> Option<&str> {
@@ -245,6 +267,19 @@ pub struct BreakpointInfo {
     pub log_if: Option<String>,
     pub halt_if: Option<String>,
     pub requested_name: Option<String>,
+    /// One entry per `--struct` flag, in declaration order. Surfaced by
+    /// `bp list` / `bp info`. The parsed `Expr` lives on `BpHooks`; this
+    /// snapshot keeps only what the listing format needs.
+    pub struct_bindings: Vec<BindingInfo>,
+}
+
+#[derive(Debug, Clone)]
+pub struct BindingInfo {
+    pub name: String,
+    pub type_name: String,
+    /// Original `expr` source text (e.g. `[rcx]`). Round-trips through
+    /// session save back into a `--struct` flag verbatim.
+    pub expr_source: String,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -272,13 +307,23 @@ pub struct Registers {
 /// Names are unified across x64 and x86: `Rax` covers both `rax` and `eax`,
 /// `Rip` covers both `rip` and `eip`, etc. The platform layer projects
 /// these onto whichever CONTEXT field exists for the agent's bitness.
+///
+/// `EFlags` is deliberately NOT in this enum. The VEH stores its own
+/// state inside `EFlags` (TF for the rearm-step dance, RF for HW-BP
+/// resume) and writes the saved CONTEXT back to the CPU on resume, so a
+/// user-supplied `eflags=` would silently disable BPs (TF cleared →
+/// no rearm), infinite-loop in our VEH (RF cleared → same DR slot
+/// re-fires), or kill the host (TF set with no matching rearm →
+/// `EXCEPTION_CONTINUE_SEARCH` → OS unhandled-exception filter). The
+/// natural footgun is `regs` showing TF=1 in a dump and the user
+/// piping it back through `setregs`. Rejected at `parse_regs` with a
+/// pointed message instead.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RegName {
     Rax, Rcx, Rdx, Rbx,
     Rsp, Rbp, Rsi, Rdi,
     R8, R9, R10, R11, R12, R13, R14, R15,
     Rip,
-    Eflags,
 }
 
 impl RegName {
@@ -287,6 +332,11 @@ impl RegName {
     /// corresponding `R*` slot. Unknown names return `None` so the caller
     /// can surface "no such register: foo" instead of silently dropping
     /// the edit.
+    ///
+    /// `eflags` is deliberately not parsed here — see the type-level
+    /// comment on `RegName`. `parse_regs` intercepts `eflags` ahead of
+    /// this call with a pointed error so the user gets "eflags is
+    /// VEH-managed" instead of "unknown register `eflags`".
     pub fn parse(s: &str) -> Option<Self> {
         Some(match s {
             "rax" | "eax" => Self::Rax,
@@ -306,7 +356,6 @@ impl RegName {
             "r14" => Self::R14,
             "r15" => Self::R15,
             "rip" | "eip" => Self::Rip,
-            "eflags" => Self::Eflags,
             _ => return None,
         })
     }
@@ -333,8 +382,34 @@ impl RegName {
             Self::R14 => regs.r14 = value,
             Self::R15 => regs.r15 = value,
             Self::Rip => regs.rip = value,
-            Self::Eflags => regs.eflags = value as u32,
         }
+    }
+
+    /// Lowercase canonical name. Unified across architectures (`Rip` →
+    /// `"rip"`, never `"eip"`). Used to build user-facing error
+    /// messages — `Debug` prints the variant name (`Rip`) which doesn't
+    /// match the `name=value` syntax the user typed.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Rax => "rax", Self::Rcx => "rcx", Self::Rdx => "rdx", Self::Rbx => "rbx",
+            Self::Rsp => "rsp", Self::Rbp => "rbp", Self::Rsi => "rsi", Self::Rdi => "rdi",
+            Self::R8 => "r8", Self::R9 => "r9", Self::R10 => "r10", Self::R11 => "r11",
+            Self::R12 => "r12", Self::R13 => "r13", Self::R14 => "r14", Self::R15 => "r15",
+            Self::Rip => "rip",
+        }
+    }
+
+    /// `true` for x64-only registers (R8–R15). The x86 platform impl
+    /// silently ignores writes to these slots (its CONTEXT has no R8+
+    /// fields), so accepting them on a 32-bit agent would be a silent
+    /// no-op — the strict-validation policy says reject up front and
+    /// name the offending register instead.
+    pub fn is_x64_only(self) -> bool {
+        matches!(
+            self,
+            Self::R8 | Self::R9 | Self::R10 | Self::R11
+            | Self::R12 | Self::R13 | Self::R14 | Self::R15
+        )
     }
 }
 
@@ -467,6 +542,15 @@ pub trait Process: Send + Sync {
     /// OS-level pid surfaced via `/info`. Conceptually constant for the
     /// lifetime of the agent.
     fn pid(&self) -> u32;
+
+    /// Pointer width of the target process in bytes (4 on x86, 8 on x64).
+    /// Default returns the host pointer width via `size_of::<usize>()`,
+    /// which is correct for in-process agents like `haunt-windows`. Used
+    /// by `bp set --struct` to reject `ptr32` schemas against an x64
+    /// agent (or vice versa) before the BP arms.
+    fn pointer_width(&self) -> u8 {
+        std::mem::size_of::<usize>() as u8
+    }
 
     /// OS thread id of the *calling* thread. Used by `core::run` to register
     /// agent-spawned threads (the accept thread + per-request workers) into
@@ -721,6 +805,9 @@ fn route(
         (Method::Get, "/memory/regions") => Some(noarg(query, || handle_regions(process))),
         (Method::Get, "/memory/search") => Some(handle_memory_search(process, query)),
         (Method::Get, "/threads") => Some(noarg(query, || handle_threads(process))),
+        (Method::Post, "/schemas") => Some(handle_schema_set(query, req)),
+        (Method::Get, "/schemas") => Some(noarg(query, handle_schema_list)),
+        (Method::Delete, "/schemas") => Some(noarg(query, || handle_schema_clear(process))),
         (Method::Post, "/shutdown") => Some(noarg(query, || {
             // Order matters: `shutdown_halts` must run BEFORE we stop
             // accepting requests. The platform impl is responsible for both
@@ -761,6 +848,16 @@ fn route(
                 return noarg(query, || handle_module_exports(process, &percent_decode(name)));
             }
         }
+    }
+
+    // Dynamic /schemas/<TypeName> — GET shows, DELETE drops.
+    if let Some(rest) = path.strip_prefix("/schemas/") {
+        let name = percent_decode(rest);
+        return match method {
+            Method::Get => noarg(query, || handle_schema_show(&name)),
+            Method::Delete => noarg(query, || handle_schema_drop(process, &name)),
+            _ => text(405, "method not allowed"),
+        };
     }
 
     text(404, "not found")
@@ -804,6 +901,9 @@ fn handle_halt_sub(
                 Ok(p) => p,
                 Err(e) => return text(400, &e),
             };
+            if let Err(e) = validate_patch_for_arch(&patch, process.pointer_width()) {
+                return text(400, &e);
+            }
             match process.halt_set_regs(hit_id, &patch) {
                 Ok(()) => text(200, "ok"),
                 Err(BpError::NotFound) => text(404, "not found"),
@@ -911,8 +1011,19 @@ fn parse_resume_mode(query: &str) -> Result<ResumeMode, String> {
 }
 
 fn handle_info(process: &dyn Process) -> Response<Body> {
+    // Surface trace-ring drop counters so users can tell whether a
+    // shorter-than-expected `/events` or `/logs` stream means "BPs
+    // didn't fire" vs. "fires hit the re-entry guard" vs. "ring
+    // overflowed before the consumer drained it." Both are silent
+    // record losses by construction (re-entry to avoid a deadlock,
+    // overflow to bound memory); making them visible is the project's
+    // standard answer to silent-default risks.
+    let (ev_re, ev_ov) = events::drop_counters();
+    let (lg_re, lg_ov) = logs::drop_counters();
     let body = format!(
-        "version={}\narch={}\npid={}\nuptime_ms={}\n",
+        "version={}\narch={}\npid={}\nuptime_ms={}\n\
+         events_dropped_reentry={ev_re}\nevents_dropped_overflow={ev_ov}\n\
+         logs_dropped_reentry={lg_re}\nlogs_dropped_overflow={lg_ov}\n",
         env!("CARGO_PKG_VERSION"),
         ARCH,
         process.pid(),
@@ -999,8 +1110,8 @@ fn handle_memory_search(process: &dyn Process, query: &str) -> Response<Body> {
                     if n == 0 {
                         return text(400, "limit: must be > 0");
                     }
-                    if n > 4096 {
-                        return text(400, "limit: must be <= 4096");
+                    if n > MAX_SEARCH_LIMIT {
+                        return text(400, &format!("limit: must be <= {MAX_SEARCH_LIMIT}"));
                     }
                     limit = n;
                 }
@@ -1135,6 +1246,19 @@ fn format_regs(r: &Registers, modules: &[ModuleInfo]) -> String {
 /// - any unknown register name (so a typo like `rxx=0` is surfaced rather
 ///   than silently dropped — the previous behaviour combined with a blind
 ///   overwrite turned typos into target-process crashes)
+/// - `eflags` (see below)
+///
+/// `eflags` is rejected outright. The VEH stores its rearm-step bit (TF)
+/// and HW-BP resume bit (RF) inside `EFlags`, and the saved CONTEXT is
+/// written back to the CPU on resume. A user `eflags=` patch would clear
+/// TF mid-rearm (silently disabling the BP and leaking a stale
+/// `PENDING_SW`/`PENDING_PAGE` rearm into a future unrelated TF), clear
+/// RF mid-HW-BP (infinite loop in our VEH), or set TF with no matching
+/// rearm pending (host kill via `EXCEPTION_CONTINUE_SEARCH`). The
+/// natural footgun is `regs` showing TF=1 and the user piping that line
+/// back through `setregs`. There is no documented user need to edit
+/// `eflags` mid-halt; if one materialises later, add a separate
+/// explicit knob that masks VEH-managed bits.
 fn parse_regs(body: &str) -> Result<Vec<(RegName, u64)>, String> {
     let mut out = Vec::new();
     for (lineno, raw) in body.lines().enumerate() {
@@ -1146,6 +1270,15 @@ fn parse_regs(body: &str) -> Result<Vec<(RegName, u64)>, String> {
             .split_once('=')
             .ok_or_else(|| format!("line {}: expected `name=value`", lineno + 1))?;
         let name = name.trim();
+        if name == "eflags" {
+            return Err(format!(
+                "line {}: refusing to setregs `eflags`: it carries VEH-managed bits \
+                 (TF for BP rearm, RF for HW-BP resume) that the agent rewrites on \
+                 every halt. Editing it can silently disable BPs or kill the host. \
+                 Drop the eflags line; every other register merges normally.",
+                lineno + 1,
+            ));
+        }
         let value = parse_u64(value.trim())
             .ok_or_else(|| format!("line {}: bad value for {name}", lineno + 1))?;
         let reg = RegName::parse(name)
@@ -1161,6 +1294,48 @@ fn parse_u64(s: &str) -> Option<u64> {
     } else {
         s.parse().ok()
     }
+}
+
+/// Reject patch entries that would silently no-op or truncate on the
+/// target agent's pointer width. Two cases:
+///
+/// - `R8`–`R15` on a 32-bit agent: those slots have no x86 CONTEXT
+///   field, so the merge is a silent no-op. The natural footgun is a
+///   user pasting an x64 `regs` dump into an x86 `setregs` and not
+///   realising those lines did nothing.
+/// - Any value > `u32::MAX` on a 32-bit agent: the platform writes
+///   `r.foo as u32` into the CONTEXT, silently discarding the high
+///   half. Same x64-dump-into-x86-setregs footgun, but for the address
+///   value rather than the register name.
+///
+/// Other widths fall through (only x86 and x64 are supported targets;
+/// adding a future ARM64 would have its own check). 64-bit agents
+/// accept the full u64 range — every register slot is 64 bits.
+fn validate_patch_for_arch(
+    patch: &[(RegName, u64)],
+    ptr_width: u8,
+) -> Result<(), String> {
+    if ptr_width != 4 {
+        return Ok(());
+    }
+    for &(name, value) in patch {
+        if name.is_x64_only() {
+            return Err(format!(
+                "register `{}` is x64-only; agent is 32-bit (the merge would be a silent no-op). \
+                 Drop this line; if you copied from an x64 regs dump, only the e* / rax-rdi / rsp / rbp / rsi / rdi / rip lines apply.",
+                name.as_str(),
+            ));
+        }
+        if value > u32::MAX as u64 {
+            return Err(format!(
+                "value 0x{value:x} for `{}` exceeds 32-bit range on this x86 agent (would silently truncate to 0x{:x}). \
+                 Re-check the source — common cause is piping an x64 regs dump into an x86 setregs.",
+                name.as_str(),
+                value as u32,
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Front-door checks applied to every request. Three independent gates:
@@ -1329,6 +1504,7 @@ fn handle_bp_set(process: &dyn Process, query: &str) -> Response<Body> {
     let mut log_raw: Option<String> = None;
     let mut log_if_raw: Option<String> = None;
     let mut halt_if_raw: Option<String> = None;
+    let mut struct_raw: Vec<String> = Vec::new();
     for (k, v) in parse_query(query) {
         match k {
             "addr" => match parse_usize(&v) {
@@ -1357,6 +1533,7 @@ fn handle_bp_set(process: &dyn Process, query: &str) -> Response<Body> {
             "log" => log_raw = Some(v),
             "log_if" => log_if_raw = Some(v),
             "halt_if" => halt_if_raw = Some(v),
+            "struct" => struct_raw.push(v),
             _ => return text(400, &format!("unknown query param: {k}")),
         }
     }
@@ -1440,9 +1617,93 @@ fn handle_bp_set(process: &dyn Process, query: &str) -> Response<Body> {
         },
         None => None,
     };
-    let hooks = BpHooks { log, log_cond, halt_cond };
 
-    match process.set_breakpoint(BpSpec { addr, kind, options, hooks, requested_name }) {
+    // Validate `--struct` bindings against the schema registry, then
+    // hold the schema lock across the BP install. Each binding is
+    // `name=Type@expr`: name is a fresh local binding (must be unique
+    // per BP), Type must already exist in the registry, expr must parse,
+    // and every pointer field reachable through that type must match the
+    // agent's pointer width (rejects `ptr32` schemas on x64 / vice versa).
+    //
+    // The schema lock is held across `set_breakpoint` to close the
+    // TOCTOU where a concurrent `schema drop` (which now also holds the
+    // schema lock across its bp-list scan) could remove a referenced
+    // type between our validation and the BP install. Lock order is
+    // schema → bp throughout: this handler is the only place we hold
+    // schema across a bp-registry mutation, and `schema drop` /
+    // `schema clear` only acquire bp-registry under the schema lock
+    // for a brief read. SW/page installs are microsecond-scale; HW
+    // installs suspend other threads but those threads can't be in the
+    // schema lock (only this handler and `schema drop`/`clear` hold it,
+    // all of which are agent-thread-only).
+    let mut struct_bindings: Vec<dsl::StructBinding> = Vec::new();
+    let target_ptr_width = process.pointer_width();
+    let reg = schema::registry::lock();
+    {
+        let mut seen_names: std::collections::HashSet<String> =
+            std::collections::HashSet::with_capacity(struct_raw.len());
+        for s in &struct_raw {
+            let b = match dsl::parse_struct_binding(s) {
+                Ok(b) => b,
+                Err(e) => return text(400, &format!("--struct '{s}': {e}")),
+            };
+            if !seen_names.insert(b.name.clone()) {
+                return text(
+                    400,
+                    &format!("--struct '{s}': binding name '{}' already used", b.name),
+                );
+            }
+            let resolved = match reg.get(&b.type_name) {
+                Some(r) => r,
+                None => {
+                    return text(
+                        400,
+                        &format!(
+                            "--struct '{s}': struct '{}' not in schema registry (load it with `haunt schema load`)",
+                            b.type_name
+                        ),
+                    );
+                }
+            };
+            if let Some((field_name, w)) = mismatched_ptr_field(resolved, target_ptr_width) {
+                return text(
+                    400,
+                    &format!(
+                        "--struct '{s}': struct '{}' has ptr{w} field '{field_name}' but agent is {}-bit",
+                        b.type_name,
+                        target_ptr_width * 8,
+                    ),
+                );
+            }
+            struct_bindings.push(b);
+        }
+    }
+
+    let hooks = BpHooks {
+        log,
+        log_cond,
+        halt_cond,
+        struct_bindings,
+    };
+
+    // Validate every `%[binding.field.subfield]` reference in the log
+    // template now, against the bindings + live schema registry. Without
+    // this, a typo'd field name surfaces only at hit time as a `<no field
+    // 'X'>` marker — fine for a typo you spot in the live log, terrible
+    // for a typo you don't notice for hours.
+    //
+    // Pass the held registry through; `validate_field_paths` requires
+    // the caller to own the lock so the schema state validated here
+    // remains the schema state used by `set_breakpoint` below.
+    if let Some(template) = &hooks.log {
+        if let Err(e) = dsl::validate_field_paths(template, &hooks.struct_bindings, &reg) {
+            return text(400, &format!("--log: {e}"));
+        }
+    }
+
+    let result = process.set_breakpoint(BpSpec { addr, kind, options, hooks, requested_name });
+    drop(reg);
+    match result {
         // Echo the resolved address back so the user can sanity-check what
         // a `name=module!symbol` lookup actually landed on. Forwarded
         // exports (kernel32!ExitProcess → ntdll!RtlExitUserProcess) make
@@ -1568,6 +1829,16 @@ fn format_bp(bp: &BreakpointInfo) -> String {
     if let Some(req) = &bp.requested_name {
         s.push_str(&format!(" requested={}", quote_msg(req)));
     }
+    for b in &bp.struct_bindings {
+        // `name=Type@expr` is the canonical binding form — quote it whole
+        // so the `=` and `@` separators don't collide with the line's
+        // outer `key=value` syntax. Session save parses this back via the
+        // same quoted-string handler used by `log` / `requested`.
+        s.push_str(&format!(
+            " struct={}",
+            quote_msg(&format!("{}={}@{}", b.name, b.type_name, b.expr_source))
+        ));
+    }
     s.push('\n');
     s
 }
@@ -1680,6 +1951,288 @@ fn handle_events(query: &str) -> Response<Body> {
         ));
     }
     text(200, &body)
+}
+
+// --- Schemas (struct-layout registry) ----------------------------------
+//
+// `POST /schemas` — body is a `.layouts` source. `?replace=true` overwrites
+// colliding struct names atomically; otherwise collisions reject the whole
+// upload (409). The agent re-validates regardless of what the CLI did.
+//
+// `GET /schemas` — flat list, name-sorted.
+// `GET /schemas/<Type>` — fields of one struct.
+// `DELETE /schemas/<Type>` — drop one.
+// `DELETE /schemas` — wipe.
+
+const MAX_SCHEMA_BODY: usize = 1024 * 1024;
+
+fn handle_schema_set(query: &str, req: &mut Request) -> Response<Body> {
+    let mut replace = false;
+    for (k, v) in parse_query(query) {
+        match k {
+            "replace" => match parse_bool(&v) {
+                Some(b) => replace = b,
+                None => return text(400, "replace: expected true|false"),
+            },
+            _ => return text(400, &format!("unknown query param: {k}")),
+        }
+    }
+
+    let mut body = Vec::new();
+    let limit = (MAX_SCHEMA_BODY as u64) + 1;
+    if req.as_reader().take(limit).read_to_end(&mut body).is_err() {
+        return text(500, "body read error");
+    }
+    if body.len() > MAX_SCHEMA_BODY {
+        return text(400, &format!("body too large (max {MAX_SCHEMA_BODY} bytes)"));
+    }
+    let src = match std::str::from_utf8(&body) {
+        Ok(s) => s,
+        Err(_) => return text(400, "body: not valid UTF-8"),
+    };
+
+    let schema = match schema::compile(src) {
+        Ok(s) => s,
+        Err(err) => {
+            let mut buf: Vec<u8> = Vec::new();
+            if schema::render_compile_error(&err, "schema", src, false, &mut buf).is_err() {
+                return text(500, "diag render error");
+            }
+            let body = String::from_utf8(buf).unwrap_or_else(|_| "schema invalid".into());
+            return text(400, &body);
+        }
+    };
+
+    let policy = if replace {
+        schema::registry::ReplacePolicy::Replace
+    } else {
+        schema::registry::ReplacePolicy::Reject
+    };
+
+    let mut reg = schema::registry::lock();
+    match reg.add(schema, policy) {
+        Ok(out) => {
+            let mut body = String::new();
+            body.push_str(&format!("added={} replaced={}\n", out.added.len(), out.replaced.len()));
+            for n in &out.added {
+                body.push_str(&format!("+ {n}\n"));
+            }
+            for n in &out.replaced {
+                body.push_str(&format!("~ {n}\n"));
+            }
+            text(200, &body)
+        }
+        Err(schema::registry::RegistryError::NameCollision { existing }) => {
+            let names = existing.join(", ");
+            text(
+                409,
+                &format!(
+                    "name collision: struct(s) already defined: {names} \
+                     (re-upload with ?replace=true to overwrite)\n"
+                ),
+            )
+        }
+        Err(schema::registry::RegistryError::NotFound { name }) => {
+            // Unreachable in `add`, but exhaustive match for safety.
+            text(500, &format!("internal: unexpected NotFound for '{name}'"))
+        }
+    }
+}
+
+fn handle_schema_list() -> Response<Body> {
+    let reg = schema::registry::lock();
+    let mut body = String::new();
+    for s in reg.iter_sorted() {
+        body.push_str(&format!(
+            "{} size=0x{:X} fields={}\n",
+            s.name,
+            s.size,
+            s.fields().len()
+        ));
+    }
+    text(200, &body)
+}
+
+fn handle_schema_show(name: &str) -> Response<Body> {
+    let reg = schema::registry::lock();
+    let Some(s) = reg.get(name) else {
+        return text(404, &format!("struct '{name}' not in registry"));
+    };
+    text(200, &emit_struct_source(s))
+}
+
+/// Render a `ResolvedStruct` back to canonical `.layouts` source. Lossless
+/// for layout (re-uploadable byte-for-byte equivalent), lossy for comments
+/// and exact whitespace. Round-trips through `GET /schemas/<Type>` →
+/// `POST /schemas` identically.
+///
+/// Two-pass formatter: first pass measures the widest type token and the
+/// widest `name[arr]` so the second pass can column-align them. Same shape
+/// as a hand-aligned source file — easier to scan than the prior
+/// single-space form, still re-parseable byte-for-byte.
+fn emit_struct_source(s: &schema::layout::ResolvedStruct) -> String {
+    let rows: Vec<(String, String, u64)> = s
+        .fields()
+        .iter()
+        .map(|f| {
+            let ty = format_field_kind(f);
+            // Field-level array dim (`name[N]`) — distinct from `cstr[N]` /
+            // `bytes[N]`, which is part of the type token itself.
+            let name_arr = if f.array_count > 1 {
+                format!("{}[{}]", f.name, f.array_count)
+            } else {
+                f.name.clone()
+            };
+            (ty, name_arr, f.offset)
+        })
+        .collect();
+
+    let ty_w = rows.iter().map(|(t, _, _)| t.len()).max().unwrap_or(0);
+    let name_w = rows.iter().map(|(_, n, _)| n.len()).max().unwrap_or(0);
+
+    let mut out = format!("struct {} size=0x{:X} {{\n", s.name, s.size);
+    for (ty, name_arr, off) in &rows {
+        out.push_str(&format!(
+            "    {ty:<ty_w$}  {name_arr:<name_w$}  @0x{off:X}\n",
+            ty_w = ty_w,
+            name_w = name_w,
+        ));
+    }
+    out.push_str("}\n");
+    out
+}
+
+fn handle_schema_drop(process: &dyn Process, name: &str) -> Response<Body> {
+    // Reject the drop while any active BP binds to this struct — the BP's
+    // template would render `<unknown type>` markers at next hit, which is
+    // exactly the silent breakage AGENTS.md warns against.
+    //
+    // The BP scan and the registry mutation must happen under the SAME
+    // schema-registry lock acquisition, otherwise a `bp set --struct`
+    // racing this handler can slip in between the scan and the remove:
+    // it acquires schema-lock, sees `name` valid, drops schema-lock,
+    // takes bp-registry-lock, registers the BP — and our drop, which
+    // saw an empty referencing-list, deletes the schema out from under
+    // it. Lock order is schema → bp throughout (`handle_bp_set` follows
+    // the same order at the `--struct` validation site), so holding
+    // schema across the bp-list scan can't deadlock.
+    let mut reg = schema::registry::lock();
+    let referencing = bps_referencing(process, &[name.to_string()]);
+    if !referencing.is_empty() {
+        return text(
+            409,
+            &format!(
+                "struct '{name}' is referenced by {} active breakpoint(s) (ids {}); \
+                 clear them before dropping the struct\n",
+                referencing.len(),
+                referencing
+                    .iter()
+                    .map(|id| id.0.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ),
+        );
+    }
+    match reg.remove(name) {
+        Ok(()) => text(200, &format!("dropped={name}\n")),
+        Err(_) => text(404, &format!("struct '{name}' not in registry")),
+    }
+}
+
+fn handle_schema_clear(process: &dyn Process) -> Response<Body> {
+    // Same rationale as drop: every BP binding silently breaks if its
+    // type vanishes. Listing the BPs in the error lets the user run
+    // `haunt bp clear <id>` for each before retrying.
+    //
+    // Same lock-ordering rationale as `handle_schema_drop`: schema lock
+    // held across both the BP scan and the wipe so a concurrent
+    // `bp set --struct` can't slip a new binding in between.
+    let mut reg = schema::registry::lock();
+    let bound: Vec<BpId> = process
+        .breakpoints()
+        .into_iter()
+        .filter(|b| !b.struct_bindings.is_empty())
+        .map(|b| b.id)
+        .collect();
+    if !bound.is_empty() {
+        return text(
+            409,
+            &format!(
+                "{} active breakpoint(s) bind to schema structs (ids {}); \
+                 clear them before wiping the registry\n",
+                bound.len(),
+                bound
+                    .iter()
+                    .map(|id| id.0.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ),
+        );
+    }
+    let n = reg.len();
+    reg.clear();
+    text(200, &format!("cleared={n}\n"))
+}
+
+/// Find every BP whose `--struct` bindings reference any of `names`.
+/// Returns the BP IDs in `bp list` order. Pure-data so it's testable
+/// without a `Process` mock.
+fn bps_referencing(process: &dyn Process, names: &[String]) -> Vec<BpId> {
+    bps_referencing_in(&process.breakpoints(), names)
+}
+
+/// Return the first pointer field whose width disagrees with `target_width`.
+/// Both `Ptr` (opaque) and `PtrTyped` participate. Returns `(field_name,
+/// declared_width)` so the caller can render an actionable error.
+fn mismatched_ptr_field(
+    s: &schema::layout::ResolvedStruct,
+    target_width: u8,
+) -> Option<(String, u8)> {
+    for f in s.fields() {
+        if let Some(w) = f.pointer_width() {
+            if w != target_width {
+                return Some((f.name.clone(), w));
+            }
+        }
+    }
+    None
+}
+
+fn bps_referencing_in(bps: &[BreakpointInfo], names: &[String]) -> Vec<BpId> {
+    bps.iter()
+        .filter(|bp| {
+            bp.struct_bindings
+                .iter()
+                .any(|b| names.iter().any(|n| n == &b.type_name))
+        })
+        .map(|bp| bp.id)
+        .collect()
+}
+
+fn format_field_kind(f: &schema::layout::ResolvedField) -> String {
+    use schema::layout::FieldKind::*;
+    let prim = match (f.kind, f.element_size) {
+        (UInt, 1) => "u8".to_string(),
+        (UInt, 2) => "u16".to_string(),
+        (UInt, 4) => "u32".to_string(),
+        (UInt, 8) => "u64".to_string(),
+        (SInt, 1) => "i8".to_string(),
+        (SInt, 2) => "i16".to_string(),
+        (SInt, 4) => "i32".to_string(),
+        (SInt, 8) => "i64".to_string(),
+        (Float, 4) => "f32".to_string(),
+        (Float, 8) => "f64".to_string(),
+        (Bool, 1) => "bool8".to_string(),
+        (Bool, 4) => "bool32".to_string(),
+        (Ptr, 4) => "ptr32".to_string(),
+        (Ptr, 8) => "ptr64".to_string(),
+        (PtrTyped, 4) => format!("ptr32<{}>", f.pointee.as_deref().unwrap_or("?")),
+        (PtrTyped, 8) => format!("ptr64<{}>", f.pointee.as_deref().unwrap_or("?")),
+        (Cstr, n) => format!("cstr[{n}]"),
+        (Bytes, n) => format!("bytes[{n}]"),
+        (k, n) => format!("{k:?}/{n}"),
+    };
+    prim
 }
 
 fn quote_msg(s: &str) -> String {
@@ -1884,6 +2437,177 @@ mod tests {
     use super::*;
 
     #[test]
+    fn schema_emit_source_roundtrips() {
+        // Compile, emit, recompile — every struct should be identical.
+        let src = r#"
+            struct GamePlayer size=0x54 {
+                ptr32         vtable        @0x00
+                ptr32         m_pGameObject @0x44
+                ptr32<GameActor> m_pActor      @0x48
+                u32           m_entityId    @0x4C
+                u32           m_pad         @0x50
+            }
+            struct GameActor size=0x10 {
+                u32  m_health     @0x00
+                u32  m_maxHealth  @0x04
+                f32  m_scale      @0x08
+                bool32 m_inv      @0x0C
+            }
+            struct WithArrays size=0x18 {
+                u32      arr[3]  @0x00
+                cstr[8]  name    @0x0C
+                bytes[4] tag     @0x14
+            }
+        "#;
+        let s1 = schema::compile(src).expect("compile");
+        let mut emitted = String::new();
+        for st in s1.structs() {
+            emitted.push_str(&emit_struct_source(st));
+        }
+        let s2 = schema::compile(&emitted).expect("recompile emitted source");
+        for st in s1.structs() {
+            let got = s2.get(&st.name).expect("missing on roundtrip");
+            assert_eq!(st.size, got.size, "size mismatch: {}", st.name);
+            assert_eq!(st.fields().len(), got.fields().len(), "field count: {}", st.name);
+            for (a, b) in st.fields().iter().zip(got.fields()) {
+                assert_eq!(a.name, b.name);
+                assert_eq!(a.offset, b.offset);
+                assert_eq!(a.element_size, b.element_size);
+                assert_eq!(a.array_count, b.array_count);
+                assert_eq!(a.kind, b.kind);
+                assert_eq!(a.pointee, b.pointee);
+            }
+        }
+    }
+
+    #[test]
+    fn schema_emit_aligns_columns() {
+        // Mixed type-token widths (ptr32<GameActor> is wider than u32)
+        // and name widths force the formatter to pad both columns. The
+        // padding makes every type, name, and offset start at the same
+        // column.
+        let s = schema::compile(
+            r#"
+            struct align_test size=0x10 {
+                u32              a       @0x00
+                ptr32<GameActor> m_pAct  @0x04
+                u32              long_name @0x08
+                u32              z       @0x0C
+            }
+        "#,
+        )
+        .expect("compile");
+        let r = s.get("align_test").unwrap();
+        let out = emit_struct_source(r);
+        let lines: Vec<&str> = out.lines().collect();
+        // Field lines start with 4-space indent; type column starts at col 4.
+        // Whichever line is widest sets the columns; other lines are padded.
+        let field_lines: Vec<&str> = lines
+            .iter()
+            .copied()
+            .filter(|l| l.starts_with("    "))
+            .collect();
+        assert_eq!(field_lines.len(), 4);
+        // The `@` for the offset must be at the same column on every row.
+        let at_cols: Vec<usize> = field_lines
+            .iter()
+            .map(|l| l.find('@').expect("@ in field line"))
+            .collect();
+        assert!(
+            at_cols.windows(2).all(|w| w[0] == w[1]),
+            "@ columns not aligned: {at_cols:?}\n{out}"
+        );
+    }
+
+    fn bp_with_bindings(id: u64, types: &[&str]) -> BreakpointInfo {
+        BreakpointInfo {
+            id: BpId(id),
+            addr: 0,
+            kind: BpKind::Software,
+            options: BpOptions::default(),
+            hits: 0,
+            log: None,
+            log_if: None,
+            halt_if: None,
+            requested_name: None,
+            struct_bindings: types
+                .iter()
+                .enumerate()
+                .map(|(i, t)| BindingInfo {
+                    name: format!("b{i}"),
+                    type_name: (*t).to_string(),
+                    expr_source: "rcx".into(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn bps_referencing_finds_matches() {
+        let bps = vec![
+            bp_with_bindings(1, &["GamePlayer"]),
+            bp_with_bindings(2, &["GameEnemy", "GameActor"]),
+            bp_with_bindings(3, &["GameActor"]),
+            bp_with_bindings(4, &[]),
+        ];
+        let ids = bps_referencing_in(&bps, &["GameActor".to_string()]);
+        assert_eq!(ids, vec![BpId(2), BpId(3)]);
+        let ids = bps_referencing_in(&bps, &["GamePlayer".to_string()]);
+        assert_eq!(ids, vec![BpId(1)]);
+    }
+
+    #[test]
+    fn bps_referencing_empty_when_no_overlap() {
+        let bps = vec![bp_with_bindings(1, &["Foo"]), bp_with_bindings(2, &["Bar"])];
+        assert!(bps_referencing_in(&bps, &["Baz".to_string()]).is_empty());
+    }
+
+    #[test]
+    fn ptr_width_check_passes_when_match() {
+        let s = schema::compile(
+            "struct ptr_test_64 size=0x10 { ptr64 a @0x00 ptr64<other> b @0x08 }",
+        )
+        .expect("compile");
+        let r = s.get("ptr_test_64").unwrap();
+        assert!(mismatched_ptr_field(r, 8).is_none());
+    }
+
+    #[test]
+    fn ptr_width_check_finds_mismatch() {
+        let s = schema::compile(
+            "struct ptr_test_32 size=0x8 { ptr32 vt @0x00 ptr32 b @0x04 }",
+        )
+        .expect("compile");
+        let r = s.get("ptr_test_32").unwrap();
+        // Agent is 64-bit; struct uses ptr32 — first ptr field flagged.
+        let (name, w) = mismatched_ptr_field(r, 8).expect("expected mismatch");
+        assert_eq!(name, "vt");
+        assert_eq!(w, 4);
+    }
+
+    #[test]
+    fn ptr_width_check_ignores_non_ptr_fields() {
+        let s = schema::compile(
+            "struct ptr_test_no_ptr size=0x10 { u32 a @0x00 u64 b @0x08 }",
+        )
+        .expect("compile");
+        let r = s.get("ptr_test_no_ptr").unwrap();
+        assert!(mismatched_ptr_field(r, 8).is_none());
+        assert!(mismatched_ptr_field(r, 4).is_none());
+    }
+
+    #[test]
+    fn bps_referencing_handles_multiple_names() {
+        let bps = vec![
+            bp_with_bindings(1, &["Foo"]),
+            bp_with_bindings(2, &["Bar"]),
+            bp_with_bindings(3, &["Quux"]),
+        ];
+        let ids = bps_referencing_in(&bps, &["Foo".to_string(), "Bar".to_string()]);
+        assert_eq!(ids, vec![BpId(1), BpId(2)]);
+    }
+
+    #[test]
     fn parse_regs_accepts_x64_and_x86_names() {
         let p = parse_regs("rax=0x10\neax=0x20\n").unwrap();
         assert_eq!(p, vec![(RegName::Rax, 0x10), (RegName::Rax, 0x20)]);
@@ -1924,10 +2648,83 @@ mod tests {
     }
 
     #[test]
-    fn reg_name_eflags_truncates_to_u32() {
-        let mut r = Registers::default();
-        RegName::Eflags.write(&mut r, 0xffff_ffff_0000_0001);
-        assert_eq!(r.eflags, 0x0000_0001);
+    fn validate_patch_x64_accepts_everything() {
+        // 64-bit agent: full u64 range and r8-r15 are all legal.
+        let patch = vec![
+            (RegName::Rip, 0x7fff_ffff_ffff_ffff),
+            (RegName::R8, 0xdead_beef_dead_beef),
+            (RegName::R15, 1),
+        ];
+        assert!(validate_patch_for_arch(&patch, 8).is_ok());
+    }
+
+    #[test]
+    fn validate_patch_x86_rejects_x64_only_register() {
+        // The footgun: user pasted an x64 regs dump into an x86 setregs.
+        // Lines naming r8..r15 would silently no-op; reject up front.
+        let patch = vec![(RegName::R8, 0)];
+        let err = validate_patch_for_arch(&patch, 4).unwrap_err();
+        assert!(err.contains("r8"), "{err}");
+        assert!(err.contains("x64-only"), "{err}");
+        assert!(err.contains("32-bit"), "{err}");
+    }
+
+    #[test]
+    fn validate_patch_x86_rejects_oversized_value() {
+        // The footgun: rip from an x64 dump is 0x7ff... — would truncate
+        // to a low-32 value silently and the thread resumes into junk.
+        let patch = vec![(RegName::Rip, 0x1_0000_0000)];
+        let err = validate_patch_for_arch(&patch, 4).unwrap_err();
+        assert!(err.contains("rip"), "{err}");
+        assert!(err.contains("32-bit"), "{err}");
+        assert!(err.contains("truncate"), "{err}");
+    }
+
+    #[test]
+    fn validate_patch_x86_accepts_in_range_value() {
+        // Anything that fits in u32 is fine on x86.
+        let patch = vec![
+            (RegName::Rip, 0x4012_3456),
+            (RegName::Rax, 0xffff_ffff),
+            (RegName::Rsp, 0),
+        ];
+        assert!(validate_patch_for_arch(&patch, 4).is_ok());
+    }
+
+    #[test]
+    fn reg_name_is_x64_only_classification() {
+        // Defensive: any future shuffle of variants must keep the
+        // r8..r15 set marked correctly. Caller sites depend on this.
+        for r in [
+            RegName::R8, RegName::R9, RegName::R10, RegName::R11,
+            RegName::R12, RegName::R13, RegName::R14, RegName::R15,
+        ] {
+            assert!(r.is_x64_only(), "{r:?} should be x64-only");
+        }
+        for r in [
+            RegName::Rax, RegName::Rcx, RegName::Rdx, RegName::Rbx,
+            RegName::Rsp, RegName::Rbp, RegName::Rsi, RegName::Rdi,
+            RegName::Rip,
+        ] {
+            assert!(!r.is_x64_only(), "{r:?} should not be x64-only");
+        }
+    }
+
+    #[test]
+    fn parse_regs_rejects_eflags_with_explanation() {
+        // `eflags` carries VEH-managed bits (TF/RF). A blind merge would
+        // silently disable BPs (TF off → no rearm) or kill the host (TF
+        // on with no pending rearm → unhandled-exception filter). The
+        // natural footgun is `regs` showing TF=1 in a dump and a script
+        // piping it back through setregs. Reject at parse time with a
+        // pointed message rather than a generic "unknown register".
+        let err = parse_regs("rax=0\neflags=0x100\n").unwrap_err();
+        assert!(err.contains("eflags"), "{err}");
+        assert!(err.contains("VEH-managed"), "{err}");
+        // And the reject must be a hard stop — partial accept (rax merged,
+        // eflags rejected) would leave the caller thinking the request
+        // half-applied.
+        assert!(parse_regs("rax=0\neflags=0x100\n").is_err());
     }
 
     #[test]

@@ -47,6 +47,16 @@ pub fn set_dr_addr(ctx: &mut CONTEXT, slot: u8, addr: u64) {
     }
 }
 
+pub fn dr_addr(ctx: &CONTEXT, slot: u8) -> u64 {
+    match slot {
+        0 => ctx.Dr0 as u64,
+        1 => ctx.Dr1 as u64,
+        2 => ctx.Dr2 as u64,
+        3 => ctx.Dr3 as u64,
+        _ => 0,
+    }
+}
+
 pub fn extract_regs(ctx: &CONTEXT) -> Registers {
     Registers {
         rax: ctx.Eax as u64, rcx: ctx.Ecx as u64, rdx: ctx.Edx as u64, rbx: ctx.Ebx as u64,

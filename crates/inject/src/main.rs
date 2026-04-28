@@ -1,5 +1,6 @@
 //! haunt-inject — load a DLL into a running Windows process via the classic
-//! CreateRemoteThread(LoadLibraryA) pattern.
+//! CreateRemoteThread(LoadLibraryW) pattern. UTF-16 (not -A) so non-ASCII
+//! paths survive the round-trip into the target.
 //!
 //! Usage: haunt-inject --pid <n> <path-to-dll>
 
@@ -105,7 +106,7 @@ fn parse_args() -> Result<(u32, PathBuf), String> {
 fn print_help() {
     println!("haunt-inject --pid <pid> <path-to-dll>");
     println!();
-    println!("Loads a DLL into the target process using CreateRemoteThread(LoadLibraryA).");
+    println!("Loads a DLL into the target process using CreateRemoteThread(LoadLibraryW).");
 }
 
 fn inject(pid: u32, dll_path_wide: &[u16]) -> Result<(), String> {

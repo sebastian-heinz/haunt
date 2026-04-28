@@ -356,6 +356,16 @@ pub fn list() -> Vec<BreakpointInfo> {
             log_if: e.hooks.log_cond_text().map(|s| s.to_string()),
             halt_if: e.hooks.halt_cond_text().map(|s| s.to_string()),
             requested_name: e.requested_name.clone(),
+            struct_bindings: e
+                .hooks
+                .struct_bindings
+                .iter()
+                .map(|b| haunt_core::BindingInfo {
+                    name: b.name.clone(),
+                    type_name: b.type_name.clone(),
+                    expr_source: b.expr_source.clone(),
+                })
+                .collect(),
         })
         .collect()
 }

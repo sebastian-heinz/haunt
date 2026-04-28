@@ -26,11 +26,42 @@ use super::arch;
 
 // DLL_THREAD_ATTACH HW propagation runs under loader lock, so it can't log
 // safely. Counters let /threads surface "X attaches succeeded, Y failed".
+//
+// `attach_ok` only increments after a readback verify confirms DR0..3/DR7
+// actually persisted. `SetThreadContext` returning success is not enough:
+// Wine and some AC shims silently drop debug-register writes — the call
+// reports success but the registers stay zero. Without verification we'd
+// claim HW BPs were installed when nothing fired.
 static ATTACH_OK: AtomicU64 = AtomicU64::new(0);
 static ATTACH_FAIL: AtomicU64 = AtomicU64::new(0);
 
 pub fn attach_counters() -> (u64, u64) {
     (ATTACH_OK.load(Ordering::Relaxed), ATTACH_FAIL.load(Ordering::Relaxed))
+}
+
+/// Re-read DR0..3/DR7 via `GetThreadContext` and compare against the values
+/// we just wrote into `expected`. Returns true only if every field matches.
+///
+/// Wine and some AC shims accept a `SetThreadContext` call with debug-
+/// register fields and return success while silently discarding the writes.
+/// Trusting the return value would mean attach counters and `/threads`
+/// claim HW BPs are live when they aren't. No allocation, no locks, no
+/// logging — safe to call under loader lock or while a thread is suspended.
+unsafe fn verify_dr_state(h: *mut core::ffi::c_void, expected: &CONTEXT) -> bool {
+    let mut got: CONTEXT = unsafe { zeroed() };
+    arch::init_debug_context(&mut got);
+    if unsafe { GetThreadContext(h, &mut got) } == 0 {
+        return false;
+    }
+    if arch::dr7(&got) != arch::dr7(expected) {
+        return false;
+    }
+    for slot in 0..4u8 {
+        if arch::dr_addr(&got, slot) != arch::dr_addr(expected, slot) {
+            return false;
+        }
+    }
+    true
 }
 
 /// Read the current debug-register state for a thread we already opened. Returns
@@ -48,12 +79,12 @@ pub fn read_dr_state(tid: u32) -> Option<([u64; 4], u64)> {
         if !ok {
             return None;
         }
-        // arch::set_dr_addr-style accessors for read; do it inline since the
-        // arch module only exposes setters for DR addresses.
-        #[cfg(target_arch = "x86_64")]
-        let drs = [ctx.Dr0, ctx.Dr1, ctx.Dr2, ctx.Dr3];
-        #[cfg(target_arch = "x86")]
-        let drs = [ctx.Dr0 as u64, ctx.Dr1 as u64, ctx.Dr2 as u64, ctx.Dr3 as u64];
+        let drs = [
+            arch::dr_addr(&ctx, 0),
+            arch::dr_addr(&ctx, 1),
+            arch::dr_addr(&ctx, 2),
+            arch::dr_addr(&ctx, 3),
+        ];
         Some((drs, arch::dr7(&ctx)))
     }
 }
@@ -164,8 +195,19 @@ pub fn apply_current_thread() {
                     );
                 }
                 arch::set_dr7(&mut ctx, dr7);
+                // Re-assert ContextFlags before SetThreadContext.
+                // `init_debug_context` only writes ContextFlags (not the
+                // DR fields), so this is defensive against any future
+                // arch helper that might mutate it. Cheap, and removing
+                // it would be the kind of "looks redundant, isn't" trap
+                // that bites the next maintainer.
                 arch::init_debug_context(&mut ctx);
-                applied = SetThreadContext(h, &ctx) != 0;
+                if SetThreadContext(h, &ctx) != 0 {
+                    // Verify the kernel actually retained DR0..3/DR7. Under
+                    // Wine and some AC shims, this readback returns zeros
+                    // even though SetThreadContext succeeded.
+                    applied = verify_dr_state(h, &ctx);
+                }
             }
             CloseHandle(h);
             applied
@@ -288,6 +330,18 @@ where
     // event records, flooding the rings. Reading the snapshot once
     // (rather than calling `is_agent` per-thread, which is TLS-local and
     // wouldn't work cross-thread anyway) gives a consistent view.
+    //
+    // Snapshot staleness: an agent worker can exit during the sweep and
+    // the kernel can recycle its tid to a new non-agent thread before
+    // we visit that tid. The recycled tid stays in our `agents` set
+    // (snapshot is frozen), so we'd skip the new thread here. That's
+    // benign because every newly-created thread runs through
+    // `DLL_THREAD_ATTACH` before becoming runnable, and that callback
+    // applies the current snapshot via `apply_current_thread`. Order:
+    // `snapshot_write` (publishes the BP) happens before this sweep, so
+    // any thread created from that point on already saw the BP via
+    // `DLL_THREAD_ATTACH`. The skip here is a redundant no-op rather
+    // than a missed install.
     let agents: std::collections::HashSet<u32> =
         haunt_core::thread_role::agent_tids().into_iter().collect();
     let mut applied = 0u32;
@@ -301,6 +355,7 @@ where
     // makes that property robust to future edits to the loop body.
     const FAILURES_CAP: usize = 64;
     let mut failures: Vec<ApplyFailure> = Vec::with_capacity(FAILURES_CAP);
+    let mut verify_failures: u32 = 0;
     enumerate_threads(|tid| {
         if tid == tid_self || agents.contains(&tid) {
             return;
@@ -338,10 +393,20 @@ where
                 fail_errno = GetLastError();
             } else {
                 modify(&mut ctx);
+                // Re-assert ContextFlags before SetThreadContext —
+                // see the matching comment in `apply_current_thread`.
                 arch::init_debug_context(&mut ctx);
                 if SetThreadContext(h, &ctx) == 0 {
                     fail_reason = Some("SetThreadContext");
                     fail_errno = GetLastError();
+                } else if !verify_dr_state(h, &ctx) {
+                    // SetThreadContext returned success but DR0..3/DR7
+                    // didn't persist. Wine and some AC shims silently
+                    // drop debug-register writes; without this check the
+                    // sweep would report success while no BP fires.
+                    fail_reason = Some("DR-not-honored");
+                    fail_errno = 0;
+                    verify_failures += 1;
                 }
             }
             // Resume FIRST, log SECOND. The order is load-bearing.
@@ -359,6 +424,16 @@ where
         warn!("hw apply: {}(tid={}) failed: errno={}", f.reason, f.tid, f.errno);
     }
     haunt_core::info!("hw apply: {applied} threads updated, {skipped} skipped");
+    // If every miss was a verify failure, the kernel below us is dropping
+    // DR writes silently — surface a single explicit hint so users don't
+    // chase phantom "BP installed but never fires" symptoms.
+    if applied == 0 && verify_failures > 0 && verify_failures == skipped {
+        warn!(
+            "hw apply: 0 threads honored DR registers ({verify_failures} verify failures); \
+             likely Wine or an anti-cheat / kernel shim that silently discards SetThreadContext \
+             debug-register writes — HW breakpoints are non-functional in this host"
+        );
+    }
 }
 
 pub fn enumerate_threads<F>(mut cb: F)

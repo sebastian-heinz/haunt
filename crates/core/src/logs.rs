@@ -20,6 +20,7 @@
 
 use std::cell::Cell;
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -47,6 +48,19 @@ pub struct LogRecord {
 static RING: OnceLock<Mutex<Inner>> = OnceLock::new();
 static CV: OnceLock<Condvar> = OnceLock::new();
 static EPOCH: OnceLock<Instant> = OnceLock::new();
+
+/// See `events::DROP_REENTRY`. Same semantic, separate ring.
+static DROP_REENTRY: AtomicU64 = AtomicU64::new(0);
+/// See `events::DROP_OVERFLOW`. Same semantic, separate ring.
+static DROP_OVERFLOW: AtomicU64 = AtomicU64::new(0);
+
+/// `(reentry, overflow)`. Read-only snapshot for `/info`.
+pub fn drop_counters() -> (u64, u64) {
+    (
+        DROP_REENTRY.load(Ordering::Relaxed),
+        DROP_OVERFLOW.load(Ordering::Relaxed),
+    )
+}
 
 struct Inner {
     deque: VecDeque<LogRecord>,
@@ -87,6 +101,7 @@ fn epoch() -> Instant {
 /// supplies it so this module stays platform-agnostic.
 pub fn push(level: Level, tid: u32, msg: String) {
     if IN_PUSH.with(|f| f.replace(true)) {
+        DROP_REENTRY.fetch_add(1, Ordering::Relaxed);
         return;
     }
     let millis = epoch().elapsed().as_millis() as u64;
@@ -95,6 +110,7 @@ pub fn push(level: Level, tid: u32, msg: String) {
         g.next_id = g.next_id.wrapping_add(1);
         if g.deque.len() == RING_CAP {
             g.deque.pop_front();
+            DROP_OVERFLOW.fetch_add(1, Ordering::Relaxed);
         }
         g.deque.push_back(LogRecord { id, millis, level, tid, msg });
         cv().notify_all();

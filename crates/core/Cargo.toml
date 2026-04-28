@@ -11,3 +11,5 @@ readme = "../../README.md"
 
 [dependencies]
 tiny_http = { version = "0.12", default-features = false }
+chumsky = "0.10"
+ariadne = "0.5"

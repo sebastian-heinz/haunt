@@ -5,6 +5,7 @@ mod log;
 mod modules;
 mod process;
 mod regions;
+mod safe_read;
 mod stack;
 
 use std::ffi::c_void;

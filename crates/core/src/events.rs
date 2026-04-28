@@ -7,6 +7,7 @@
 
 use std::cell::Cell;
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -35,6 +36,27 @@ pub struct Event {
 static RING: OnceLock<Mutex<Inner>> = OnceLock::new();
 static CV: OnceLock<Condvar> = OnceLock::new();
 static EPOCH: OnceLock<Instant> = OnceLock::new();
+
+/// Records dropped because the producing thread was already inside
+/// `push` (a `--log` BP fired on a function the events path itself
+/// calls — allocator, mutex, etc.). Surfaced via `/info` so a user
+/// staring at "fewer events than expected" can tell whether they BP'd
+/// the events path's call graph.
+static DROP_REENTRY: AtomicU64 = AtomicU64::new(0);
+
+/// Records evicted from the front of the ring because a new push
+/// arrived while the deque was full. Symptom of producer rate >
+/// consumer drain rate. Surfaced via `/info` so a user with stale-
+/// `since` long-poll loops can tell they're falling behind.
+static DROP_OVERFLOW: AtomicU64 = AtomicU64::new(0);
+
+/// `(reentry, overflow)`. Read-only snapshot for `/info`.
+pub fn drop_counters() -> (u64, u64) {
+    (
+        DROP_REENTRY.load(Ordering::Relaxed),
+        DROP_OVERFLOW.load(Ordering::Relaxed),
+    )
+}
 
 struct Inner {
     deque: VecDeque<Event>,
@@ -79,9 +101,12 @@ fn epoch() -> Instant {
 
 /// Push a new event. Cheap on the hot path: one mutex acquire, no notify cost
 /// when no one is waiting. Re-entrant calls on the same thread are dropped
-/// (see `IN_PUSH`).
+/// (see `IN_PUSH`); ring-overflow evictions and re-entry drops both bump
+/// counters surfaced via `drop_counters()` so silent losses are auditable
+/// rather than invisible.
 pub fn push(bp_id: Option<u64>, tid: u32, rip: u64, msg: String) {
     if IN_PUSH.with(|f| f.replace(true)) {
+        DROP_REENTRY.fetch_add(1, Ordering::Relaxed);
         return;
     }
     let millis = epoch().elapsed().as_millis() as u64;
@@ -90,6 +115,7 @@ pub fn push(bp_id: Option<u64>, tid: u32, rip: u64, msg: String) {
         g.next_id = g.next_id.wrapping_add(1);
         if g.deque.len() == RING_CAP {
             g.deque.pop_front();
+            DROP_OVERFLOW.fetch_add(1, Ordering::Relaxed);
         }
         g.deque.push_back(Event { id, bp_id, tid, rip, msg, millis });
         cv().notify_all();

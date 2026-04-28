@@ -50,20 +50,54 @@ enum StepMode {
 // silently lose the earlier rearm when on_int3 overwrote a page rearm
 // from on_guard_page (or vice versa).
 //
-// `PENDING_PAGE` is a Vec because a single instruction can fault on
-// multiple guarded pages before the next TF fires: a misaligned load
-// crossing a page boundary (or `rep movs` etc.) traps once per page,
-// and each `on_guard_page` invocation must record a rearm. A scalar
-// Option would lose every page after the first — silently making the
-// BP one-shot for the lost pages on the very first multi-page hit.
+// Both are Vecs because more than one rearm of the same kind can be
+// pending at once — but the two have different semantics:
+//
+// - `PENDING_PAGE`: a single instruction can fault on multiple guarded
+//   pages before its TF fires. A misaligned load crossing a page
+//   boundary (or `rep movs` etc.) traps once per page, and each
+//   `on_guard_page` invocation must record a rearm. on_single_step
+//   drains the WHOLE PENDING_PAGE vec — every entry corresponds to
+//   the SAME instruction whose TF just fired.
+//
+// - `PENDING_SW`: every int3 is its own instruction with its own TF.
+//   Multi-entry happens only when an int3 fires before a previous
+//   int3's TF has had a chance to fire. Two ways:
+//     (a) User setregs rip=ANOTHER_BP_ADDR, resume — the resumed
+//         CONTEXT lands directly on another int3. Outer's int3 has
+//         no chance to TF because the user redirected IP.
+//     (b) Recursive VEH — a `--no-halt --log` BP fires on a function
+//         the agent's own VEH path calls (allocator, mutex). Outer
+//         on_int3's run_hooks calls into user code, that code hits
+//         another int3, inner on_int3 stacks on top.
+//   These two cases need different rearm semantics:
+//     (a) Outer's instruction will NEVER execute (IP redirected).
+//         Eagerly rearm outer at inner's on_int3 entry, then
+//         continue with inner.
+//     (b) Outer's instruction WILL execute later (after outer's VEH
+//         unwinds and kernel restores outer's CONTEXT). Defer outer's
+//         rearm until outer's TF fires (LIFO drain).
+//   Distinguished via `INT3_NESTING`: when on_int3 entry sees
+//   non-empty `PENDING_SW` AND nesting==0, the previous fire's outer
+//   VEH has fully returned without TF — case (a). Otherwise case (b).
+//   on_single_step pops just the TOP of `PENDING_SW` (the most-
+//   recently-pushed rearm, whose instruction just executed).
 //
 // Cell (not RefCell) on purpose: RefCell::borrow_mut panics if the
 // cell is already borrowed, and `panic = "abort"` on the cdylib means
 // any panic kills the host. The take/set pattern below is panic-free.
 thread_local! {
-    static PENDING_SW: Cell<Option<SoftwareRearm>> = const { Cell::new(None) };
+    static PENDING_SW: Cell<Vec<SoftwareRearm>> = const { Cell::new(Vec::new()) };
     static PENDING_PAGE: Cell<Vec<PageRearm>> = const { Cell::new(Vec::new()) };
     static STEP: Cell<StepMode> = const { Cell::new(StepMode::None) };
+    /// Depth of nested fault-handler invocations (`on_int3` /
+    /// `on_guard_page`). Incremented on entry, decremented on exit.
+    /// Read by `on_int3` to distinguish "previous fire was orphaned
+    /// by a setregs IP redirect" (nesting==0, eagerly rearm) from
+    /// "previous fire is the outer VEH still on the stack" (nesting>0,
+    /// defer to its own TF). Not incremented by `on_single_step` — TF
+    /// is post-instruction, not pending-instruction.
+    static FAULT_NESTING: Cell<u32> = const { Cell::new(0) };
 }
 
 pub(super) unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
@@ -91,6 +125,30 @@ pub(super) unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i
 }
 
 unsafe fn on_int3(addr: usize, context: &mut CONTEXT) -> i32 {
+    // Stale-rearm sweep: if PENDING_SW is non-empty AND we're entering
+    // at nesting depth 0, the previous fire's outer VEH has fully
+    // returned without TF firing — i.e., the user redirected IP via
+    // setregs and the previous instruction never executed. Eagerly
+    // rearm those entries so the original BPs stay armed, then start
+    // a fresh push for THIS fire. If nesting > 0, we're inside an
+    // outer VEH and PENDING_SW belongs to outer's still-pending
+    // instruction — leave it alone (LIFO drain in on_single_step
+    // will pick up our entry first when our TF fires).
+    //
+    // `try_with` (not `with`) so a thread-local key marked destroyed
+    // mid-teardown can't panic the host. Treating "key gone" as
+    // nesting==0 is safe — if the thread is exiting we won't get a
+    // recursive VEH anyway.
+    if FAULT_NESTING.try_with(|n| n.get()).unwrap_or(0) == 0 {
+        eager_rearm_stale_sw();
+    }
+    enter_fault();
+    let result = on_int3_inner(addr, context);
+    leave_fault();
+    result
+}
+
+unsafe fn on_int3_inner(addr: usize, context: &mut CONTEXT) -> i32 {
     // Find the SW BP at this address — regardless of tid filter, because the
     // int3 byte is in memory and any thread hitting it must have its execution
     // recovered or the process crashes.
@@ -147,7 +205,7 @@ unsafe fn on_int3(addr: usize, context: &mut CONTEXT) -> i32 {
     arch::set_ip(context, addr as u64);
     context.EFlags |= TRAP_FLAG;
     let one_shot_id = if options.one_shot && tid_matches { Some(bp_id) } else { None };
-    PENDING_SW.with(|p| p.set(Some(SoftwareRearm { addr, one_shot_id })));
+    push_sw_rearm(SoftwareRearm { addr, one_shot_id });
 
     if tid_matches {
         let _ = run_hooks_then_maybe_halt(bp_id, options, &hooks, context);
@@ -167,43 +225,44 @@ unsafe fn on_single_step(context: &mut CONTEXT) -> i32 {
     // EXCEPTION_CONTINUE_SEARCH, and the OS would terminate the host.
     context.EFlags &= !TRAP_FLAG;
 
-    // 1. Process all pending re-arms accumulated since the last single-
-    // step. Page and SW rearms can both be live simultaneously when a
-    // page BP and a SW BP fire on the same instruction (e.g. a write
-    // to a code page that also has an int3). Lose neither.
-    let sw_rearm = PENDING_SW.with(|p| p.take());
-    // `try_with` rather than `with` because `Vec<PageRearm>` has a
-    // destructor that the thread-local runtime runs at thread exit.
-    // After that destructor has run, `with` would panic — and a panic
-    // under `panic = "abort"` on the cdylib kills the host. Our VEH
-    // can theoretically fire on a thread mid-teardown (e.g., a SW BP
-    // on a function called from `DLL_THREAD_DETACH` of another DLL);
-    // silently treating PENDING_PAGE as empty in that window is the
-    // correct degradation.
+    // 1. Process pending re-arms.
+    //
+    // SW rearm: pop the TOP of `PENDING_SW` (LIFO). Each int3 is its
+    // own instruction; the most-recently-pushed entry is the one
+    // whose instruction just executed and triggered this TF. Older
+    // entries belong to OUTER VEH callbacks still on the stack —
+    // their TFs come later, when the kernel restores their CONTEXTs
+    // after the inner VEHs unwind.
+    //
+    // PAGE rearm: drain ALL of `PENDING_PAGE`. A single instruction
+    // can fault on multiple guarded pages within one execution (rep
+    // movs, misaligned load) — every entry is for THIS instruction
+    // whose TF just fired.
+    //
+    // `try_with` rather than `with` because `Vec<...>` has a destructor
+    // that the thread-local runtime runs at thread exit. After that
+    // destructor has run, `with` would panic — and a panic under
+    // `panic = "abort"` on the cdylib kills the host. Our VEH can
+    // theoretically fire on a thread mid-teardown (e.g., a SW BP on a
+    // function called from `DLL_THREAD_DETACH` of another DLL); silently
+    // treating the rearm buffer as empty in that window is the correct
+    // degradation.
+    let sw_rearm: Option<SoftwareRearm> = PENDING_SW
+        .try_with(|p| {
+            let mut v = p.take();
+            let last = v.pop();
+            p.set(v);
+            last
+        })
+        .ok()
+        .flatten();
     let page_rearms: Vec<PageRearm> = PENDING_PAGE
         .try_with(|p| p.take())
         .unwrap_or_default();
     let had_rearm = sw_rearm.is_some() || !page_rearms.is_empty();
 
     if let Some(rearm) = sw_rearm {
-        if let Some(id) = rearm.one_shot_id {
-            // Byte already restored in on_int3; just drop the entry.
-            super::remove_entry_internal(id);
-        } else if let Ok(mut reg) = super::registry().lock() {
-            if let Some(entry) = reg.values_mut().find(|e| {
-                e.addr == rearm.addr && matches!(e.state, KindState::Software(_))
-            }) {
-                if let KindState::Software(sw) = &mut entry.state {
-                    match software::write_byte(rearm.addr, software::INT3) {
-                        Ok(_) => sw.active = true,
-                        Err(_) => warn!(
-                            "sw bp rearm at 0x{:x} failed; bp will not fire again",
-                            rearm.addr,
-                        ),
-                    }
-                }
-            }
-        }
+        apply_sw_rearm(rearm);
     }
     for rearm in page_rearms {
         page::rearm(rearm.base, rearm.original_protect);
@@ -267,6 +326,22 @@ unsafe fn on_single_step(context: &mut CONTEXT) -> i32 {
 }
 
 unsafe fn on_guard_page(addr: usize, context: &mut CONTEXT) -> i32 {
+    // Stale-rearm sweep at nesting depth 0 — same rationale as in
+    // `on_int3`. A page fault is also a fresh fault that should
+    // discharge any stale outer SW rearm. (Stale PAGE rearms work
+    // differently: see comment in `eager_rearm_stale_sw` for why
+    // we don't sweep them here.) `try_with` for the same teardown-
+    // panic reason as in `on_int3`.
+    if FAULT_NESTING.try_with(|n| n.get()).unwrap_or(0) == 0 {
+        eager_rearm_stale_sw();
+    }
+    enter_fault();
+    let result = on_guard_page_inner(addr, context);
+    leave_fault();
+    result
+}
+
+unsafe fn on_guard_page_inner(addr: usize, context: &mut CONTEXT) -> i32 {
     // Single lock acquisition: previously this did `find_containing`
     // (which took the registry lock, returned, and dropped it) and then
     // re-acquired the lock to mutate the entry. A concurrent `clear()`
@@ -360,6 +435,118 @@ fn push_page_rearm(rearm: PageRearm) {
     });
 }
 
+/// Append a SW rearm to this thread's pending-rearm stack. Same
+/// panic-avoidance rationale as `push_page_rearm`. The stack drains
+/// LIFO in `on_single_step` — see `PENDING_SW`'s comment for why
+/// LIFO is the correct semantic. Cap at the same 64 as
+/// `push_page_rearm` to bound a hypothetical runaway producer; real
+/// workloads stay at 1–2 entries (one for the current fire, plus
+/// one outer if a recursive VEH is in progress).
+fn push_sw_rearm(rearm: SoftwareRearm) {
+    let _ = PENDING_SW.try_with(|p| {
+        let mut v = p.take();
+        const PENDING_SW_CAP: usize = 64;
+        if v.len() < PENDING_SW_CAP {
+            v.push(rearm);
+        }
+        p.set(v);
+    });
+}
+
+/// Mark fault-handler entry. Used to tell `on_int3` / `on_guard_page`
+/// whether a non-empty `PENDING_SW` is "stale outer rearm from a
+/// setregs IP redirect" (nesting==0) vs "outer VEH still on the
+/// stack" (nesting>0). Paired with `leave_fault` at every return
+/// path of the wrapped handler.
+fn enter_fault() {
+    let _ = FAULT_NESTING.try_with(|n| n.set(n.get().saturating_add(1)));
+}
+
+fn leave_fault() {
+    let _ = FAULT_NESTING.try_with(|n| n.set(n.get().saturating_sub(1)));
+}
+
+/// Apply (or evict) one SW rearm: write 0xCC back at the address (or
+/// remove the registry entry if it was a one-shot). Each rearm is
+/// independent — failure here doesn't propagate and doesn't affect
+/// other pending rearms.
+unsafe fn apply_sw_rearm(rearm: SoftwareRearm) {
+    if let Some(id) = rearm.one_shot_id {
+        // Byte already restored in on_int3; just drop the entry.
+        super::remove_entry_internal(id);
+        return;
+    }
+    if let Ok(mut reg) = super::registry().lock() {
+        if let Some(entry) = reg.values_mut().find(|e| {
+            e.addr == rearm.addr && matches!(e.state, KindState::Software(_))
+        }) {
+            if let KindState::Software(sw) = &mut entry.state {
+                match software::write_byte(rearm.addr, software::INT3) {
+                    Ok(_) => sw.active = true,
+                    Err(_) => warn!(
+                        "sw bp rearm at 0x{:x} failed; bp will not fire again",
+                        rearm.addr,
+                    ),
+                }
+            }
+        }
+        // No matching entry: the BP was cleared between `on_int3`
+        // and here. `clear()` already restored the original byte
+        // under the registry lock, so skipping the rearm is correct.
+    }
+}
+
+/// At fault-handler entry with nesting==0, drain any stale entries
+/// from `PENDING_SW` and apply them eagerly. The only way we can
+/// arrive here with non-empty `PENDING_SW` and nesting==0 is: a
+/// previous `on_int3` pushed a rearm, set TF=1 in CONTEXT, returned;
+/// the user's setregs (or a TF-clearing context modification)
+/// redirected IP somewhere else; the resumed thread landed at this
+/// new fault before the original instruction's TF could fire. The
+/// original instruction will NEVER execute, so its rearm has to be
+/// applied now — otherwise the original BP would silently disable.
+///
+/// Stale `PENDING_PAGE` is NOT swept here. Page rearms accumulate
+/// per-instruction (multi-page faults during one instruction), and
+/// "the previous instruction's TF didn't fire" implies the page
+/// fault and the new fault are on the same instruction or an IP-
+/// redirected-to instruction; the page rearms still apply to the
+/// current TF cycle. Worst case is a stale page rearm reapplies
+/// PAGE_GUARD on a page that's no longer being accessed — benign,
+/// and `take_orphan` recovers.
+///
+/// KNOWN LIMITATION: the symmetric "recursive VEH" case for PAGE
+/// breakpoints can still double-fire. If an outer `on_guard_page`'s
+/// `run_hooks` triggers an inner SW int3, inner's TF drains all of
+/// `PENDING_PAGE` (including outer's [X-page]). When outer's VEH
+/// eventually returns, the CPU re-faults on page X (guarded again)
+/// → outer fires twice for one logical hit. Unifying SW and PAGE
+/// under a NESTING-tag would fix this but conflicts with the
+/// drain-all-per-TF semantic the multi-page-per-instruction case
+/// requires (changelog v0.4.0). Acceptable trade-off: the failure
+/// mode is a noisy double-record, not a silent disable, and the
+/// scenario requires the user to combine page BPs with SW BPs on
+/// agent call paths — well off the documented happy path.
+unsafe fn eager_rearm_stale_sw() {
+    let stale: Vec<SoftwareRearm> = PENDING_SW
+        .try_with(|p| p.take())
+        .unwrap_or_default();
+    if stale.is_empty() {
+        return;
+    }
+    // Re-arm each stale entry. Failures are best-effort logged in
+    // apply_sw_rearm; we keep going regardless so one unmappable
+    // address doesn't leave others disabled.
+    for rearm in stale {
+        // For a one-shot, the registry entry was already removed
+        // by the user's resume path? No — one-shot removal happens
+        // in on_single_step on TF. For a stale one-shot, the user
+        // bypassed TF (setregs IP redirect), so the entry still
+        // exists. Drop it now (the byte is already original).
+        apply_sw_rearm(rearm);
+    }
+}
+
 /// Translate a user-selected resume mode into the post-halt CONTEXT and
 /// per-thread step state.
 ///
@@ -428,7 +615,7 @@ unsafe fn run_hooks_then_maybe_halt(
     };
     if log_passed {
         if let Some(template) = &hooks.log {
-            emit_log_event(bp_id, &ctx, &template.parts);
+            emit_log_event(bp_id, &ctx, &template.parts, &hooks.struct_bindings);
         }
     }
 
@@ -474,8 +661,13 @@ unsafe fn run_hooks_then_maybe_halt(
     }
 }
 
-fn emit_log_event(bp_id: BpId, ctx: &HitEvalCtx, template: &[TemplatePart]) {
-    let rendered = dsl::render(template, ctx);
+fn emit_log_event(
+    bp_id: BpId,
+    ctx: &HitEvalCtx,
+    template: &[TemplatePart],
+    bindings: &[dsl::StructBinding],
+) {
+    let rendered = dsl::render(template, bindings, ctx);
     let tid = unsafe { GetCurrentThreadId() };
     // The events ring is the primary high-rate trace channel. The log
     // pipeline mirror is at debug! level so it's filtered out by the
@@ -517,23 +709,17 @@ impl dsl::Eval for HitEvalCtx {
     }
 
     fn read_ptr(&self, addr: u64) -> Option<u64> {
-        const PTR_BYTES: usize = std::mem::size_of::<usize>();
-        let mut buf = [0u8; 8];
-        let mut read: usize = 0;
-        let ok = unsafe {
-            ReadProcessMemory(
-                GetCurrentProcess(),
-                addr as *const _,
-                buf.as_mut_ptr() as *mut _,
-                PTR_BYTES,
-                &mut read,
-            ) != 0
-                && read == PTR_BYTES
-        };
-        if !ok {
-            return None;
+        const PTR_BYTES: u8 = std::mem::size_of::<usize>() as u8;
+        crate::safe_read::read_ptr(addr as usize, PTR_BYTES).map(|v| v as u64)
+    }
+
+    fn read_bytes(&self, addr: u64, len: usize) -> Option<Vec<u8>> {
+        let mut buf = vec![0u8; len];
+        if crate::safe_read::read_into(addr as usize, &mut buf) {
+            Some(buf)
+        } else {
+            None
         }
-        Some(u64::from_le_bytes(buf))
     }
 }
 

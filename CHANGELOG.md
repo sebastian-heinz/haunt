@@ -7,6 +7,210 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-04-28
+
+### Fixed
+- **`setregs eflags=…` rejected at parse.** The VEH stores its own
+  rearm-step state inside `EFlags` — TF for the SW/page rearm dance,
+  RF for HW-BP resume — and writes the saved CONTEXT back to the CPU
+  on resume. A user-supplied `eflags=` patch could clear TF mid-rearm
+  (silently disabling the BP), clear RF mid-HW-BP (infinite loop in
+  the VEH), or set TF with no matching rearm pending (host kill via
+  `EXCEPTION_CONTINUE_SEARCH`). The natural footgun was `regs`
+  showing `TF=1` and the user piping that line back through
+  `setregs`. `RegName::Eflags` removed; `parse_regs` returns 400 with
+  a pointed message naming the VEH-managed bits.
+- **`setregs` arch-mismatch rejected on x86 agents.** Two failure
+  modes the platform-side merge would have silently swallowed:
+    - **`r8`–`r15` lines.** Those slots have no x86 CONTEXT field,
+      so the merge was a silent no-op.
+    - **Values > `u32::MAX`.** The platform writes `r.field as u32`
+      into the CONTEXT, so the high half was silently discarded.
+  Both reject at the HTTP edge with a 400 naming the register and,
+  for value truncation, the truncated bits the user would have got.
+  Most likely cause is piping an x64 regs dump into an x86 setregs.
+- **SW BP rearm survives user-driven IP redirects and recursive VEH.**
+  Two tightly-related bugs in the rearm bookkeeping:
+    - Old `Cell<Option<SoftwareRearm>>` lost the outer rearm when a
+      user `setregs rip=ANOTHER_BP_ADDR` resume landed directly on a
+      second SW BP — second `on_int3` overwrote the first's rearm,
+      and the original BP became silently one-shot.
+    - Naive `Vec` drain-all-per-TF (the obvious fix) introduced a
+      symmetric problem: a `--no-halt --log` BP fired inside a
+      function the agent's own VEH path calls (`Vec::with_capacity`
+      → `RtlAllocateHeap`) would rearm the outer BP before its
+      instruction had a chance to execute, causing it to re-fire
+      (one logical hit → two records).
+  Replaced with NESTING + LIFO + eager-rearm: `FAULT_NESTING`
+  thread-local tracks fault-handler depth; `on_int3` /
+  `on_guard_page` eagerly rearm stale `PENDING_SW` entries when
+  entering at depth 0 (setregs case) and rely on LIFO pop in
+  `on_single_step` for proper recursion (recursive-VEH case).
+  Helpers (`enter_fault`, `leave_fault`, `apply_sw_rearm`,
+  `eager_rearm_stale_sw`) extracted so each operation lives in one
+  place.
+- **DSL shift overflow no longer silently wraps mod-64.** `<<` and
+  `>>` over `u64` used `wrapping_shl` / `wrapping_shr`, so `1 << 64`
+  evaluated to `1` rather than `0` — surprising under the strict-
+  validation policy. Now `checked_shl` / `checked_shr` reject any
+  shift ≥ 64 (or any value not fitting in `u32`); the result surfaces
+  as `?` in templates and as a failed gate (predicate value treated
+  as zero), same as register-not-found and unreadable-deref.
+- **Schema-drop / `bp set` TOCTOU closed.** `handle_schema_drop`
+  and `handle_schema_clear` now hold the schema-registry lock across
+  both the BP-list scan AND the `reg.remove` call; `handle_bp_set`
+  holds the schema lock across both binding validation AND
+  `set_breakpoint` to keep the schema state validated equal to the
+  state the install observed. Lock order is `schema → BP` throughout;
+  `validate_field_paths` requires an externally-held `&Registry`
+  argument so the caller can never accidentally re-acquire (which
+  would be a self-deadlock with `std::sync::Mutex`).
+- **Schema parser no longer leaks source per upload.** Previous
+  implementation `Box::leak`-ed the cleaned source on every
+  `parse()` call to satisfy chumsky's lifetime requirement. Bounded
+  per call (≤ `MAX_SCHEMA_BODY` = 1 MB) but unbounded over the
+  agent's lifetime — a script cycling schemas held onto every
+  prior cleaned source forever. Now uses `Rich::into_owned()` so
+  the cleaned `String` drops normally at the end of `parse`.
+- **`strip_comments` preserves byte offsets for non-ASCII source.**
+  Previous implementation `out.push(b as char)` re-encoded each byte
+  as a Unicode codepoint, doubling the byte count for any byte
+  ≥ `0x80` and breaking ariadne's caret rendering for the rest of
+  the source. Real schemas are ASCII (the grammar enforces it), but
+  a stray non-ASCII byte in a comment would shift every subsequent
+  span. Now builds a `Vec<u8>` and reuses source bytes verbatim
+  outside comments.
+- **CLI socket timeouts now propagate setting failures.** Previous
+  `let _ = stream.set_read_timeout(...)` silently swallowed any OS
+  rejection; under a hypothetical broken environment the CLI would
+  hang indefinitely. Errors now bubble up as `set_read_timeout: …`.
+- **`haunt-inject` doc/help text aligned to `LoadLibraryW`.** Code
+  has used the wide variant for non-ASCII paths since v0.2.0; the
+  doc comment and `--help` output still said `LoadLibraryA`.
+
+### Changed (breaking)
+- **`RegName::Eflags` variant removed.** See the Fixed entry on
+  `eflags` rejection. `RegName::parse("eflags")` now returns
+  `None`; `parse_regs` intercepts the name with a pointed error
+  ahead of `RegName::parse` so users get a useful message.
+- **`dsl::validate_field_paths` takes `&Registry`.** The previous
+  2-arg variant acquired the schema lock internally, which made it
+  trap-shaped: a future caller could re-introduce the
+  schema-vs-BP TOCTOU symmetric to the one closed in `handle_bp_set`.
+  Single signature now forces every caller to think about lock
+  ownership; tests use a `vfp` helper that locks-and-forwards.
+
+### Internal
+- **Defensive comment on `init_debug_context` post-DR-write.** The
+  `apply_current_thread` and `apply_to_all_threads` paths re-assert
+  `ContextFlags` after `set_dr_addr`/`set_dr7` even though the only
+  current arch helpers don't touch it. Comment names this as
+  defensive against any future helper that incidentally clears
+  the field.
+- **Snapshot-vs-tid-recycling analysis documented in
+  `apply_to_all_threads`.** Walked the scenarios; the
+  `DLL_THREAD_ATTACH` callback covers any case where the sweep
+  skips a recycled tid that landed in a stale `agent_tids`
+  snapshot. Comment in-place so the next reader doesn't have to
+  re-derive.
+
+### Added
+- **`MAX_FIELD_LENGTH = 64 KiB` per-field cap on schemas.**
+  Caps `element_size × array_count` for every field, blocking
+  typo-bombs like `bytes[1000000000]` (1 GB cstr/bytes length) and
+  `bytes[100] arr[1000000]` / `u32 arr[1048576]` (small element
+  but huge array dimension) that would allocate hundreds of MB to
+  GB on every BP hit and OOM-abort the host under
+  `panic = "abort"`. Genuine multi-MB blobs split into smaller
+  fields. New `ValidationError::FieldTooLarge`; rejected at upload
+  with the field name, total bytes, and cap in the message.
+- **`MAX_SEARCH_LIMIT = 4096` named constant.** Replaces the
+  hardcoded `4096` literal in `handle_memory_search`. Same drift-
+  avoidance reasoning as `MAX_TRACE_BATCH`. README now documents
+  the cap on the `/memory/search` endpoint signature.
+- **Drop counters in `/info`.** Four new lines —
+  `events_dropped_reentry`, `events_dropped_overflow`,
+  `logs_dropped_reentry`, `logs_dropped_overflow` — surface silent
+  record losses on the `/events` and `/logs` rings. `reentry`
+  increments when a `--log` BP fires inside a function the trace
+  path itself calls (the re-entry guard would otherwise deadlock);
+  `overflow` increments when a producer outpaces the consumer.
+  Both `events::push` and `logs::push` carry their own atomic
+  counters; `drop_counters() -> (u64, u64)` exposes them.
+- **Layout schema (`*.layouts`) parser, validator, and resolver in
+  `haunt-core::schema`.** Hand-writeable file format describing struct
+  layouts: `struct Name size=0xN { <type> <field>[<arr>] @0xOFF ... }`.
+  Types: `u8`–`u64`, `i8`–`i64`, `f32`/`f64`, `bool8`/`bool32`,
+  `ptr32`/`ptr64` with optional `<T>` for typed pointers, `cstr[N]`,
+  `bytes[N]`. Every field requires an explicit `@offset`; gaps are
+  allowed implicitly. Validation rejects size mismatches, overlap,
+  unsorted offsets, duplicate field/struct names, and zero-length
+  arrays — each error names the offending construct. Powered by
+  chumsky 0.10 and rendered via ariadne 0.5.
+- **Flat struct registry on the agent + `/schemas` HTTP surface.**
+  Single global namespace; files are pure upload conduits. `POST
+  /schemas` (re-validates server-side; `?replace=true` overwrites
+  collisions atomically), `GET /schemas`, `GET /schemas/<Type>`,
+  `DELETE /schemas/<Type>`, `DELETE /schemas`. 409 on collision under
+  the default reject policy; 404 on drop/show of unknown name.
+- **`haunt schema` CLI: `check`, `load [--replace]`, `list`,
+  `show <Type>`, `drop <Type>`, `clear`.** `check` is local-only —
+  no upload — and renders ariadne diagnostics with color when stderr
+  is a terminal. The other subcommands round-trip through the agent.
+  `schema show` emits canonical `.layouts` source so it round-trips
+  losslessly through `schema load`.
+- **`haunt session save|restore <file>` CLI commands.** Snapshot the
+  agent's struct registry and active breakpoints to JSON; replay onto
+  a fresh agent. Schemas are re-emitted as canonical source (lossy on
+  comments, lossless on layout). BPs prefer their symbolic target
+  (`module!symbol`) on restore so re-injection at a different load
+  address still hits the right code. Restore bails early if the live
+  agent's arch doesn't match the saved one. CLI-only — no agent
+  changes; uses the existing `/schemas` and `/bp/*` endpoints.
+- **`bp set --struct name=Type@expr`.** Binds a schema struct to a
+  base address evaluated each hit. Type must already exist in the
+  schema registry; binding name must be unique within the BP.
+  Repeatable for multiple structs on one BP. Stored on the BP and
+  round-trips through `bp list` and session save.
+- **Validation hardening for schemas + BPs.** Three classes of
+  hit-time surprises become BP-set-time / schema-time errors:
+    - **Template field paths validated at `bp set`.** Typo'd
+      `%[binding.field]` references (unknown binding, unknown field,
+      chain through opaque pointer or scalar, dangling typed-pointer
+      target) reject with 400 naming the failing fragment instead
+      of rendering `<...>` markers in the live log.
+    - **Schema drop / clear reject when active BPs reference the
+      affected names.** 409 with the offending BP IDs and an
+      actionable message; the user clears the BPs first. Replace
+      stays user-driven — explicit opt-in via `--replace`.
+    - **Pointer-width check at `bp set --struct`.** Schemas using
+      `ptr32` against an x64 agent (or vice versa) reject with a
+      400 naming the offending field. New `Process::pointer_width()`
+      with a default `size_of::<usize>()` impl.
+- **`schema show` output is column-aligned.** Two-pass formatter
+  pads type tokens and field names so `@offset` columns line up
+  vertically, matching the shape of a hand-written `.layouts` file.
+  Lossless against the parser; round-trips identically.
+- **`%[binding.field.subfield]` template syntax.** Reads a typed
+  field at hit time using the BP's struct bindings. Walks
+  `ptr32<T>` / `ptr64<T>` typed-pointer chains; intermediate
+  opaque pointers, scalars, or null derefs surface as `<...>`
+  markers without panicking. Formatting is type-aware:
+    - integers in hex (`0x...`)
+    - signed in decimal with sign
+    - floats in decimal
+    - `bool` as `true` / `false`
+    - `cstr[N]` as a debug-quoted UTF-8 string up to first NUL
+    - `bytes[N]` as space-separated hex octets
+    - arrays as `[v0, v1, v2]` per element
+  All reads go through a panic-free `safe_read` primitive in
+  `haunt-windows`.
+- **`safe_read` primitive in `haunt-windows`.** Panic-free typed reads
+  via `ReadProcessMemory` against the current process — for the
+  upcoming hit-time field reader. Failed reads (unmapped page, address
+  overflow, partial read) return `None` instead of triggering an
+  exception in the host.
+
 ## [0.5.2] - 2026-04-28
 
 Release-engineering only. No behavioural changes to the agent, CLI,

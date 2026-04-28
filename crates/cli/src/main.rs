@@ -10,6 +10,8 @@ use std::net::TcpStream;
 use std::process::ExitCode;
 use std::time::Duration;
 
+mod session;
+
 /// Hard ceiling on how long the CLI will block on a single response. Long-
 /// poll endpoints (`wait`, `events`, `logs`) have their own timeout knob
 /// and the agent caps it at `MAX_LONG_POLL_TIMEOUT_MS` = 300 s; 310 s here
@@ -40,7 +42,15 @@ Typical loop:
 
 Connect / introspect:
   ping                       liveness check
-  info                       version, arch (x86_64|x86), pid, uptime_ms
+  info                       version, arch (x86_64|x86), pid, uptime_ms,
+                             plus drop counters for /events and /logs:
+                             *_dropped_reentry (a --log BP fired inside
+                             a function the trace path itself calls and
+                             the re-entry guard dropped the inner
+                             record) and *_dropped_overflow (a producer
+                             outpaced the consumer, evicting old
+                             records). Non-zero values point at the
+                             diagnosis, not at a silent loss.
   version                    version string
   modules                    loaded modules: name, base, size
   exports <module>           module's exports. Forwarded entries appear
@@ -77,6 +87,7 @@ Breakpoints:
   bp set <addr|module!symbol> [--kind sw|hw|page] [--no-halt]
          [--one-shot] [--access x|w|rw|any] [--size N] [--tid N]
          [--log <template>] [--log-if <expr>] [--halt-if <expr>]
+         [--struct <name=Type@expr>]
                              Install a BP. Returns `id=N addr=0x...`
                              (the resolved address, useful when name
                              lookup crossed a forwarder).
@@ -105,6 +116,16 @@ Breakpoints:
                                  only); addr aligned to size for size>1.
                              page: --size is bytes, rounded up to pages.
                                    PAGE_GUARD fires on any access kind.
+                             --struct name=Type@expr binds a schema
+                                   struct to a base address evaluated
+                                   from `expr` (same grammar as --log
+                                   expressions, e.g. `[rcx]` to deref
+                                   rcx). Type must already be in the
+                                   schema registry. Repeatable. Stored
+                                   on the BP and round-trips through
+                                   `bp list` and session save. Template
+                                   access (`%[name.field]`) lands in a
+                                   follow-up.
                              SW + page BPs covering the same page are
                              rejected with 409 Conflict. SW BPs on a
                              byte that's already 0xCC, or on a page that
@@ -118,17 +139,27 @@ Breakpoints:
   bp clear <id>              remove a BP
 
   --log template:
-    %name      register value (e.g. %rcx, %eip)
-    %[expr]    deref expr, substitute pointed-to value
-    %{expr}    raw expression value
-    %%         literal %
+    %name              register value (e.g. %rcx, %eip)
+    %[expr]            deref expr, substitute pointed-to value
+    %{expr}            raw expression value
+    %[binding.field]   schema field value (requires --struct binding).
+                       Chained `.` follows ptr32<T>/ptr64<T> typed
+                       pointers; intermediate opaque ptrs / scalars /
+                       null derefs render as <…> markers without
+                       panicking. Type-aware formatting: ints in hex,
+                       signed in decimal with sign, floats in decimal,
+                       bools as true/false, cstr quoted, bytes as
+                       space-hex, arrays as [v0, v1, ...].
+    %%                 literal %
   --log-if and --halt-if take the same expression syntax; non-zero
   passes the gate. Gates are independent: --log-if controls log+event
   emission, --halt-if controls halt only. hits++ counts every fire
   regardless of either gate (it's the raw fire count).
   Operators: + - * & | ^ << >> ~ == != < <= > >= ()
   over hex/decimal literals, register names, [deref] subexpressions.
-  Parser depth capped at 32 levels.
+  Parser depth capped at 32 levels. Out-of-range shifts (≥ 64, or any
+  value not fitting in u32) yield `?` in templates and a failed gate
+  — the wrap-around mod-64 semantic of `wrapping_shl` is not honoured.
 
 Halts (parked threads):
   wait [--timeout <ms>] [--since <hit_id>]
@@ -157,7 +188,16 @@ Halts (parked threads):
                              effect on resume. Registers you don't name
                              keep their captured values. Both x64 (`rax`)
                              and x86 (`eax`) names work; unknown names
-                             return 400.
+                             return 400. `eflags` is rejected — it
+                             carries VEH-managed bits (TF/RF) that the
+                             agent rewrites on every halt, so editing it
+                             can silently disable BPs or kill the host.
+                             `regs` displays it for inspection only.
+                             On x86 agents, lines naming r8-r15 or
+                             values exceeding 32-bit range are also
+                             rejected (would silently no-op or truncate
+                             — the natural footgun is piping an x64
+                             regs dump into an x86 setregs).
                              Example:
                                printf 'rax=0\\n' | haunt setregs 7
                              TTY input prints a hint; pipe for scripts.
@@ -207,6 +247,53 @@ Trace events (from `--log` BPs):
                                           annotation in the output
                                           (default-on; turn off for
                                           stable parsing in scripts).
+
+Schema (struct layouts):
+  schema check <file.layouts>
+                             Local validate only — no upload. Prints
+                             `ok: N struct(s)` or ariadne diagnostics.
+  schema load <file.layouts> [--replace]
+                             Parse + validate + upload to the agent's
+                             flat struct registry. Without --replace,
+                             409s if any struct name already exists.
+                             With --replace, colliding names overwrite
+                             atomically.
+  schema list                All structs in the registry, name-sorted:
+                               <Name> size=0xN fields=N
+  schema show <Type>         Resolved layout of one struct: size and
+                             one line per field with @offset, type,
+                             and name.
+  schema drop <Type>         Remove one struct by name; 404s if absent.
+  schema clear               Wipe the entire registry.
+
+Sessions (snapshot + replay agent state):
+  session save <file>        Snapshot the agent's struct registry and
+                             active breakpoints to <file> (JSON). Lossy
+                             on schema comments, lossless on layout.
+                             Hit counts, halts, log/event records are
+                             not captured (those are state, not spec).
+  session restore <file>     Replay a session against the live agent.
+                             Schemas first (with --replace semantics so
+                             the saved state wins), then BPs. Bails out
+                             early if agent arch differs from saved.
+                             Symbol-named BPs re-resolve through the
+                             agent's name lookup, so re-injection at a
+                             different load address still hits the
+                             right code.
+
+  Layout grammar (one file, hand-written):
+    struct Name size=0xN {
+      <type> <field> [<arr>] @0xOFF
+      ...
+    }
+  Types: u8/u16/u32/u64, i8..i64, f32, f64, bool8, bool32,
+  ptr32 [<T>], ptr64 [<T>], cstr[N], bytes[N]. `# ...` line comments.
+  Every field needs an explicit @offset. Validation rejects size
+  mismatches, overlap, unsorted offsets, duplicate names, zero-
+  length arrays, and over-cap field sizes (each field's total
+  byte footprint, element_size × array_count, capped at 64 KiB to
+  bound hit-time render allocation) — each error names the
+  offending construct.
 
 Agent logs:
   logs [--since <id>] [--limit N] [--timeout <ms>] [--no-annotate]
@@ -280,6 +367,9 @@ fn dispatch(args: &[String]) -> Result<(), String> {
             get(&format!("/symbols/lookup?addr={}", url_encode(a))).map(print_ok)
         }
         "args" => cmd_args(rest),
+
+        "schema" => cmd_schema(rest),
+        "session" => session::cmd(rest),
 
         "-h" | "--help" | "help" => {
             println!("{USAGE}");
@@ -548,6 +638,11 @@ fn cmd_bp(args: &[String]) -> Result<(), String> {
                         i += 1;
                         let v = rest.get(i).ok_or("--halt-if value")?;
                         query.push_str(&format!("&halt_if={}", url_encode(v)));
+                    }
+                    "--struct" => {
+                        i += 1;
+                        let v = rest.get(i).ok_or("--struct value")?;
+                        query.push_str(&format!("&struct={}", url_encode(v)));
                     }
                     other => return Err(format!("unknown flag: {other}")),
                 }
@@ -935,6 +1030,77 @@ fn cmd_resume(args: &[String]) -> Result<(), String> {
     post(&format!("/halts/{id}/resume?mode={mode}"), &[]).map(print_ok)
 }
 
+fn cmd_schema(args: &[String]) -> Result<(), String> {
+    let sub = args
+        .first()
+        .ok_or("schema <check|load|list|show|drop|clear> ...")?
+        .as_str();
+    let rest = &args[1..];
+    match sub {
+        "check" => {
+            let path = rest.first().ok_or("schema check <file.layouts>")?;
+            let src = std::fs::read_to_string(path)
+                .map_err(|e| format!("read {path}: {e}"))?;
+            match haunt_core::schema::compile(&src) {
+                Ok(schema) => {
+                    println!("ok: {} struct(s)", schema.structs().len());
+                    let missing = schema.missing_pointee_targets();
+                    if !missing.is_empty() {
+                        eprintln!(
+                            "warning: {} typed-pointer target(s) not defined in this file:",
+                            missing.len()
+                        );
+                        for m in &missing {
+                            eprintln!("  {}::{} -> {}", m.struct_name, m.field_name, m.target);
+                        }
+                    }
+                    Ok(())
+                }
+                Err(err) => {
+                    let mut stderr = std::io::stderr();
+                    let color = std::io::stderr().is_terminal();
+                    haunt_core::schema::render_compile_error(&err, path, &src, color, &mut stderr)
+                        .map_err(|e| format!("write diagnostics: {e}"))?;
+                    Err("schema check failed".into())
+                }
+            }
+        }
+        "load" => {
+            let path = rest.first().ok_or("schema load <file.layouts> [--replace]")?;
+            let mut replace = false;
+            let mut i = 1;
+            while i < rest.len() {
+                match rest[i].as_str() {
+                    "--replace" => replace = true,
+                    other => return Err(format!("unknown flag: {other}")),
+                }
+                i += 1;
+            }
+            let src = std::fs::read_to_string(path)
+                .map_err(|e| format!("read {path}: {e}"))?;
+            let url = if replace {
+                "/schemas?replace=true".to_string()
+            } else {
+                "/schemas".to_string()
+            };
+            post(&url, src.as_bytes()).map(print_ok)
+        }
+        "list" => get("/schemas").map(print_ok),
+        "show" => {
+            let name = rest.first().ok_or("schema show <Type>")?;
+            get(&format!("/schemas/{}", url_encode(name))).map(print_ok)
+        }
+        "drop" => {
+            let name = rest.first().ok_or("schema drop <Type>")?;
+            delete(&format!("/schemas/{}", url_encode(name))).map(print_ok)
+        }
+        "clear" => delete("/schemas").map(print_ok),
+        _ => Err(format!(
+            "unknown schema subcommand: {sub} (try check|load|list|show|drop|clear)"
+        )),
+    }
+}
+
 // --- HTTP ---------------------------------------------------------------
 
 fn base_url() -> String {
@@ -953,6 +1119,10 @@ fn post(path: &str, body: &[u8]) -> Result<Vec<u8>, String> {
     request_full("POST", path, Some(body)).map(|(_, b)| b)
 }
 
+fn delete(path: &str) -> Result<Vec<u8>, String> {
+    request_full("DELETE", path, None).map(|(_, b)| b)
+}
+
 /// Like `get`/`post` but exposes the HTTP status alongside the body, for
 /// callers that need to distinguish 200 (full read) from 206 (partial
 /// content — body is the readable prefix, shorter than what was asked
@@ -966,9 +1136,18 @@ fn request_full(method: &str, path: &str, body: Option<&[u8]>) -> Result<(u16, V
     };
 
     let stream = TcpStream::connect(host_port).map_err(|e| format!("connect: {e}"))?;
+    // Surface timeout-set failures rather than swallowing them. Without
+    // a deadline the socket can hang indefinitely if the agent crashes
+    // mid-response or a stuck poll occupies the path; the project's
+    // strict-validation policy says the user should learn from the
+    // error what to investigate, not get an unbounded wait.
     let timeout = Duration::from_secs(SOCKET_READ_TIMEOUT_SECS);
-    let _ = stream.set_read_timeout(Some(timeout));
-    let _ = stream.set_write_timeout(Some(timeout));
+    stream
+        .set_read_timeout(Some(timeout))
+        .map_err(|e| format!("set_read_timeout: {e}"))?;
+    stream
+        .set_write_timeout(Some(timeout))
+        .map_err(|e| format!("set_write_timeout: {e}"))?;
     let mut stream = stream;
 
     let mut req = format!("{method} {path} HTTP/1.1\r\n");
