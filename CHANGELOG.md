@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-04-28
+
+### Added
+- **`haunt` CLI prebuilt for Linux and macOS.** The DLL and injector
+  are Windows-by-construction, but the CLI is just loopback HTTP over
+  `std::net` with no native deps — there's no reason it should only be
+  available as `haunt.exe`. Each release page now also ships:
+  - `haunt-linux-x64`, `haunt-linux-arm64` — musl-static, run on any
+    Linux distro from kernel 2.6+ with no glibc / shared-lib deps.
+  - `haunt-macos-x64`, `haunt-macos-arm64` — native Apple Silicon and
+    Intel builds.
+  Each artifact ships with a sibling `*.sha256` (formatted by
+  `shasum -a 256` so a `sha256sum -c` from any host validates it).
+  The Windows job retains its consolidated `SHA256SUMS` file so
+  existing release-asset names are unchanged.
+
 ## [0.5.0] - 2026-04-28
 
 ### Changed
