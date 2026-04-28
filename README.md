@@ -60,12 +60,14 @@ The `haunt` CLI is platform-agnostic (loopback HTTP over `std::net`,
 no `unsafe`, no native deps), so each release also ships native
 builds for non-Windows hosts:
 
-- `haunt-linux-x64`, `haunt-linux-arm64` — musl-static, run on any
-  Linux distro from kernel 2.6+ with no glibc/shared-lib deps.
-- `haunt-macos-x64`, `haunt-macos-arm64` — native Apple Silicon and
-  Intel builds.
+- `haunt-linux-x86_64`, `haunt-linux-arm64` — musl-static, run on
+  any Linux distro from kernel 2.6+ with no glibc/shared-lib deps.
+- `haunt-macos-x86_64`, `haunt-macos-arm64` — native per-arch
+  builds.
+- `haunt-macos-universal` — `lipo`-merged fat binary that runs on
+  either macOS arch, for distribution scripts that don't want to
+  branch on architecture.
 
-Each ships with a sibling `*.sha256` next to it on the release page.
 Drive a Windows-target agent from any of these by setting
 `HAUNT_URL` to the loopback-forwarded port (see "Remote" below).
 
