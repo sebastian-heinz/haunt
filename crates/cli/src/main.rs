@@ -11,10 +11,11 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 /// Hard ceiling on how long the CLI will block on a single response. Long-
-/// poll endpoints (`wait`, `events`) have their own timeout knob and the
-/// agent caps it at 60s, so 90s here gives a safety margin without hanging
-/// indefinitely if the agent crashes mid-response.
-const SOCKET_READ_TIMEOUT_SECS: u64 = 90;
+/// poll endpoints (`wait`, `events`, `logs`) have their own timeout knob
+/// and the agent caps it at `MAX_LONG_POLL_TIMEOUT_MS` = 300 s; 310 s here
+/// leaves a small slack for the response to come back over loopback
+/// without hanging indefinitely if the agent crashes mid-response.
+const SOCKET_READ_TIMEOUT_SECS: u64 = 310;
 
 const USAGE: &str = "\
 haunt <command> [args]
@@ -24,6 +25,11 @@ CLI client for the haunt agent injected into a Windows process.
 Env:
   HAUNT_URL    base URL (default http://127.0.0.1:7878)
   HAUNT_TOKEN  Bearer token for auth (default: none)
+
+Validation: every flag and value is strict. Unknown flags, malformed
+values, and out-of-range counts/timeouts fail with a 400 (HTTP) or a
+non-zero exit (CLI) that names the offending parameter — no silent
+defaults on user-supplied input.
 
 Typical loop:
   haunt bp set <addr|module!symbol>     # install breakpoint
@@ -127,9 +133,9 @@ Breakpoints:
 Halts (parked threads):
   wait [--timeout <ms>] [--since <hit_id>]
                              long-poll the next halt with id > since.
-                             Default timeout 30000 ms; agent caps at
-                             60000 ms. Returns 204 (empty body) on
-                             timeout.
+                             Default timeout 30000 ms; values above
+                             300000 ms (5 min) are rejected (400).
+                             Returns 204 (empty body) on timeout.
   halts                      list currently parked hits
   regs <hit_id>              register dump; pointers into a loaded
                              module are auto-annotated as
@@ -170,13 +176,15 @@ Halts (parked threads):
 Trace events (from `--log` BPs):
   events [--since <id>] [--limit N] [--timeout <ms>]
          [--bp-id N] [--tail N] [--no-annotate]
-                             4096-record ring buffer; oldest record is
-                             evicted on overflow. Each record: id,
+                             40960-record ring buffer; oldest record
+                             is evicted on overflow. Each record: id,
                              bp_id, tid, rip, t (ms since first event),
                              msg (the rendered template).
+                             --limit N    cap returned records (default
+                                          256, max 40960 = ring size).
                              --since X    return records with id > X,
                                           long-poll up to --timeout
-                                          (agent caps at 60000 ms).
+                                          (max 300000 ms; above is 400).
                                           With high hit rates, keep
                                           the last id you saw and pass
                                           it back as --since on the
@@ -205,10 +213,11 @@ Agent logs:
                              tail the agent's own info/warn/error
                              output (the messages haunt.dll itself
                              emits — bind status, BP install reports,
-                             VEH-path warnings). 4096-record ring,
+                             VEH-path warnings). 40960-record ring,
                              same long-poll semantics as `events`.
-                             Each record: id, t (ms since first log),
-                             level, tid, msg.
+                             --limit N defaults to 256, max 40960
+                             (= ring size). Each record: id, t (ms
+                             since first log), level, tid, msg.
 
 See README for full workflows (range watchpoint, dtrace-style tracing,
 return-value patching) and the \"Halts and global locks\" warning

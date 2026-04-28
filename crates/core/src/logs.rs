@@ -24,9 +24,12 @@ use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::log::Level;
-use crate::MAX_LONG_POLL_TIMEOUT_MS;
+use crate::{MAX_LONG_POLL_TIMEOUT_MS, MAX_TRACE_BATCH};
 
-const RING_CAP: usize = 4096;
+/// Ring capacity = `MAX_TRACE_BATCH` so a single `limit=N` call can
+/// drain the whole ring. Sourced from a shared constant in `lib.rs`
+/// so the HTTP-edge validator and the ring stay in lockstep.
+const RING_CAP: usize = MAX_TRACE_BATCH;
 
 #[derive(Debug, Clone)]
 pub struct LogRecord {

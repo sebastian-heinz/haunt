@@ -142,7 +142,7 @@ haunt bp list                          # hit counts per BP
 ```
 
 **Trace at line rate (dtrace-style).** `--log <template>` evaluates
-on every hit and emits to a 4096-record ring buffer. `--log-if` and
+on every hit and emits to a 40 960-record ring buffer. `--log-if` and
 `--halt-if` are independent gates: log/event emission and halt are
 controlled separately, so a single BP can log every call and halt
 only on the runs that match a condition.
@@ -187,7 +187,7 @@ writes into this range?":
 haunt bp set 0x00007FF6DEADBEEF --kind page --size 0x1000 --no-halt \
   --log "writer=%eip"
 sleep 5
-haunt events --since 0 --limit 4096 > writers.log
+haunt events --since 0 --limit 40960 > writers.log
 haunt bp clear <id>
 ```
 
@@ -261,11 +261,20 @@ missing header indicates either a non-CLI client or a malicious
 page. The agent also rejects requests with a non-empty, non-`null`
 `Origin` header.
 
+**Validation.** Strict on every input. Unknown query parameters,
+malformed pairs (`?foo` with no `=`), out-of-range counts and
+timeouts, and unrecognised enum values (`mode=`, `kind=`, `access=`,
+`format=`, boolean flags) all return `400` with a message that names
+the offending parameter. No silent defaults on user-supplied values;
+missing parameters that have a documented default still default.
+The agent shares the host's address space — a silently-accepted typo
+is a host-process bug, often surfacing hours later.
+
 **Concurrency.** One worker thread per request, capped at 80 total.
-Long-poll endpoints (`/halts/wait`, `/events`) share a sub-cap of
-64; the remaining 16 slots stay reserved for short requests so a
-stuck poll loop can't lock you out of `bp clear`/`resume`/`regs`.
-Over either cap returns `503 too busy`.
+Long-poll endpoints (`/halts/wait`, `/events`, `/logs`) share a
+sub-cap of 64; the remaining 16 slots stay reserved for short
+requests so a stuck poll loop can't lock you out of `bp clear`/
+`resume`/`regs`. Over either cap returns `503 too busy`.
 
 **Remote.** Drive from another machine via SSH (also encrypts the
 wire — the protocol has no TLS):
@@ -302,20 +311,21 @@ Breakpoints:
 - `GET  /bp/list` and `GET /bp/<id>` — entries include `requested=...` for BPs set by name
 
 Trace events:
-- `GET  /events?since=<id>&limit=N&timeout=<ms>[&bp_id=<id>][&tail=<n>]` — `since`/`timeout` long-polls up to 60 s; `tail=n` returns the most recent `n` matching records and disables long-polling; `bp_id` filters server-side.
+- `GET  /events?since=<id>&limit=N&timeout=<ms>[&bp_id=<id>][&tail=<n>]` — `since`/`timeout` long-polls (`timeout` ≤ 300 000 ms; above is 400); `tail=n` returns the most recent `n` matching records and disables long-polling; `bp_id` filters server-side. `limit` and `tail` must be in `[1, 40960]` (= ring capacity, so a single call can drain the whole ring).
 
 Agent logs:
 - `GET  /logs?since=<id>&limit=N&timeout=<ms>` — agent's own info/warn/
   error output (bind status, BP install reports, VEH warnings) over a
-  4096-record ring, long-polls up to 60 s. Replaces `OutputDebugString`
-  (which could block the agent if a debugger was attached but not
-  draining, and mixed output across every process on the box).
+  40 960-record ring; same `timeout` and `limit` bounds as `/events`.
+  Replaces `OutputDebugString` (which could block the agent if a
+  debugger was attached but not draining, and mixed output across
+  every process on the box).
 
 Halts:
 - `GET  /halts`
-- `GET  /halts/wait?timeout=<ms>&since=<hit_id>` — oldest hit with `id > since`; long-polls up to 60 s
+- `GET  /halts/wait?timeout=<ms>&since=<hit_id>` — oldest hit with `id > since`; `timeout` ≤ 300 000 ms (above is 400)
 - `GET  /halts/<hit_id>` — register dump; values pointing into a loaded module are auto-annotated as `module+0xoffset`
-- `GET  /halts/<hit_id>/stack[?depth=N]` — backtrace; default 32, max 256
+- `GET  /halts/<hit_id>/stack[?depth=N]` — backtrace; default 32; `depth` must be in `[1, 256]`
 - `POST /halts/<hit_id>/regs` (body: `name=value` lines)
 - `POST /halts/<hit_id>/resume?mode=continue|step|ret`
 

@@ -40,13 +40,22 @@ pub const MAX_WRITE_LEN: usize = 16 * 1024 * 1024;
 pub const MAX_REGS_BODY: usize = 64 * 1024;
 
 /// Hard cap on every long-poll endpoint's `timeout` parameter
-/// (`/halts/wait`, `/events`). A client sending `?timeout=u64::MAX`
-/// would otherwise pin an agent worker thread for ~584 million years.
-/// Defended at the HTTP edge in `handle_halts_wait` / `handle_events`,
-/// and again in the platform-side `wait_halt` / `events::poll` impls
+/// (`/halts/wait`, `/events`, `/logs`). A client sending
+/// `?timeout=u64::MAX` would otherwise pin an agent worker thread
+/// for ~584 million years. Defended at the HTTP edge (`handle_halts_
+/// wait` / `handle_events` / `handle_logs`) and again in the
+/// platform-side `wait_halt` / `events::poll` / `logs::poll` impls
 /// — defending at both layers is cheap and means a buggy direct
-/// `events::poll` caller can't bypass the edge clamp.
-pub const MAX_LONG_POLL_TIMEOUT_MS: u64 = 60_000;
+/// `events::poll` caller can't bypass the edge check.
+pub const MAX_LONG_POLL_TIMEOUT_MS: u64 = 300_000;
+
+/// Hard cap on `limit` and `tail` for `/events` and `/logs`. Matches
+/// the underlying ring capacity in `events::RING_CAP` / `logs::RING_CAP`,
+/// so a single call can drain the whole ring (a `tail=N` snapshot, or
+/// `limit=N` after a long-poll catches up). Keeping the bound and the
+/// ring size in one constant prevents drift — bumping the ring without
+/// bumping the bound would silently cap clients to the old value.
+pub const MAX_TRACE_BATCH: usize = 40_960;
 
 /// Hard cap on total concurrent worker threads. Each request runs on its
 /// own worker (~1 MB stack VM on Windows x64); the long-poll endpoints
@@ -1578,8 +1587,8 @@ fn handle_logs(query: &str) -> Response<Body> {
                     if n == 0 {
                         return text(400, "limit: must be > 0");
                     }
-                    if n > 4096 {
-                        return text(400, "limit: must be <= 4096");
+                    if n > MAX_TRACE_BATCH {
+                        return text(400, &format!("limit: must be <= {MAX_TRACE_BATCH}"));
                     }
                     limit = n;
                 }
@@ -1624,8 +1633,8 @@ fn handle_events(query: &str) -> Response<Body> {
                     if n == 0 {
                         return text(400, "limit: must be > 0");
                     }
-                    if n > 4096 {
-                        return text(400, "limit: must be <= 4096");
+                    if n > MAX_TRACE_BATCH {
+                        return text(400, &format!("limit: must be <= {MAX_TRACE_BATCH}"));
                     }
                     limit = n;
                 }
@@ -1644,8 +1653,8 @@ fn handle_events(query: &str) -> Response<Body> {
                     if n == 0 {
                         return text(400, "tail: must be > 0");
                     }
-                    if n > 4096 {
-                        return text(400, "tail: must be <= 4096");
+                    if n > MAX_TRACE_BATCH {
+                        return text(400, &format!("tail: must be <= {MAX_TRACE_BATCH}"));
                     }
                     tail = Some(n);
                 }
